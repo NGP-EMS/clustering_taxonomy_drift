@@ -1,19 +1,27 @@
 import { lazy, Suspense } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import { AppProvider, useAppCtx } from './context/AppContext.jsx'
-import Sidebar from './components/Sidebar.jsx'
+import Sidebar from './components/layout/Sidebar.jsx'
+import TopBar from './components/layout/TopBar.jsx'
+import RightInspector from './components/layout/RightInspector.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
-import ClusterDetailPanel from './components/ClusterDetailPanel.jsx'
 
-const OverviewPage      = lazy(() => import('./pages/OverviewPage.jsx'))
-const ClustersPage      = lazy(() => import('./pages/ClustersPage.jsx'))
-const SemanticSpacePage = lazy(() => import('./pages/SemanticSpacePage.jsx'))
-const AnomaliesPage     = lazy(() => import('./pages/AnomaliesPage.jsx'))
-const DriftPage         = lazy(() => import('./pages/DriftPage.jsx'))
+const Observatory    = lazy(() => import('./pages/Observatory.jsx'))
+const ClustersPage   = lazy(() => import('./pages/ClustersPage.jsx'))
+const AnomaliesPage  = lazy(() => import('./pages/AnomaliesPage.jsx'))
+const DriftPage      = lazy(() => import('./pages/DriftPage.jsx'))
+const OverviewPage   = lazy(() => import('./pages/OverviewPage.jsx'))
 
 function PageSuspense({ children }) {
   return (
-    <Suspense fallback={<div className="page-loading">Loading…</div>}>
+    <Suspense fallback={
+      <div className="flex items-center justify-center h-full">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 rounded-full border-2 border-cyan/20 border-t-cyan animate-spin" />
+          <span className="text-dust text-xs tracking-widest uppercase">Loading…</span>
+        </div>
+      </div>
+    }>
       {children}
     </Suspense>
   )
@@ -22,24 +30,35 @@ function PageSuspense({ children }) {
 function AppShell() {
   const { activePage, selectedClusterId, searchOpen } = useAppCtx()
 
+  const isObservatory = activePage === 'observatory'
+
   return (
-    <div className="app-layout">
+    <div className="flex h-screen w-screen overflow-hidden bg-obs-void">
       <Sidebar />
 
-      <div className="app-body">
-        <main className="main-content">
-          <PageSuspense>
-            {activePage === 'overview'       && <OverviewPage />}
-            {activePage === 'clusters'       && <ClustersPage />}
-            {activePage === 'semantic-space' && <SemanticSpacePage />}
-            {activePage === 'anomalies'      && <AnomaliesPage />}
-            {activePage === 'drift'          && <DriftPage />}
-          </PageSuspense>
-        </main>
+      <div className="flex flex-col flex-1 overflow-hidden min-w-0">
+        {!isObservatory && <TopBar />}
 
-        <AnimatePresence>
-          {selectedClusterId && <ClusterDetailPanel key="detail" clusterId={selectedClusterId} />}
-        </AnimatePresence>
+        <div className="flex flex-1 overflow-hidden min-w-0">
+          <main className={[
+            'flex-1 overflow-y-auto overflow-x-hidden min-w-0',
+            isObservatory ? 'overflow-hidden' : '',
+          ].join(' ')}>
+            <PageSuspense>
+              {activePage === 'observatory' && <Observatory />}
+              {activePage === 'overview'    && <OverviewPage />}
+              {activePage === 'clusters'    && <ClustersPage />}
+              {activePage === 'anomalies'   && <AnomaliesPage />}
+              {activePage === 'drift'       && <DriftPage />}
+            </PageSuspense>
+          </main>
+
+          <AnimatePresence>
+            {selectedClusterId && !isObservatory && (
+              <RightInspector key="inspector" clusterId={selectedClusterId} />
+            )}
+          </AnimatePresence>
+        </div>
       </div>
 
       <AnimatePresence>
