@@ -198,7 +198,7 @@ export function buildSpatialLayout(clusters, options = {}) {
     const minZ = Math.min(...zs), maxZ = Math.max(...zs)
     const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6)
     stats.projectionCenter = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2]
-    stats.projectionScale = (options.projectionTargetSpan || (stats.map2d ? 118 : 145)) / span
+    stats.projectionScale = (options.projectionTargetSpan || (stats.map2d ? 150 : 145)) / span
   }
 
   return clusters.map(c => {
@@ -215,7 +215,7 @@ export function buildSpatialLayout(clusters, options = {}) {
       _occRatio: occRatio,
       // Circle radius: map range ≈ 0.50–2.0 units (≈5.6–22px diameter at zoom 5.6)
       _size: stats.map2d
-        ? 0.50 + Math.pow(sizeRatio, 0.50) * 1.50
+        ? 0.24 + Math.pow(sizeRatio, 0.55) * 0.82
         : 0.20 + Math.pow(sizeRatio, 0.72) * 1.10,
       _usesPersistedProjection: hasPersistedProjection(c),
     }

@@ -14,6 +14,15 @@ function c2w(cx, cy, w, h, tx, ty, sc) {
   return [(cx - w / 2 - tx) / sc, -(cy - h / 2 - ty) / sc]
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function shortLabel(value, max = 28) {
+  const text = String(value || '').trim()
+  return text.length > max ? text.slice(0, max) + '…' : text
+}
+
 function fitAll(cls, w, h) {
   if (!cls.length) return { tx: 0, ty: 0, sc: 5 }
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
@@ -109,10 +118,10 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
 
   let focusC = null
 
-  // Glow pass for large clusters
+  // Soft halo only for meaningful large clusters; keeps dense maps from becoming a mesh.
   for (const c of cls) {
     const r = (c._size || 0.5) * sc
-    if (r < 3.5) continue
+    if (r < 7.5 || (c._sizeRatio || 0) < 0.72) continue
     const isSel = selId !== null && selId === String(c.id)
     const isHov = hovId !== null && hovId === String(c.id)
     if (isSel || isHov) continue
@@ -121,11 +130,11 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     ctx.beginPath()
     ctx.arc(px, py, r * 2.8, 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'
-    ctx.globalAlpha = 0.04
+    ctx.globalAlpha = 0.018
     ctx.fill()
     ctx.beginPath()
     ctx.arc(px, py, r * 1.6, 0, Math.PI * 2)
-    ctx.globalAlpha = 0.06
+    ctx.globalAlpha = 0.028
     ctx.fill()
   }
   ctx.globalAlpha = 1
@@ -135,13 +144,13 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     const isSel = selId !== null && selId === String(c.id)
     const isHov = hovId !== null && hovId === String(c.id)
     if (isSel || isHov) { focusC = c; continue }
-    const r = Math.max((c._size || 0.5) * sc, 1)
+    const r = Math.max((c._size || 0.5) * sc, 0.75)
     const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
     if (px + r < 0 || px - r > w || py + r < 0 || py - r > h) continue
     ctx.beginPath()
     ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'
-    ctx.globalAlpha = 0.88
+    ctx.globalAlpha = cls.length > 2500 ? 0.58 : cls.length > 1200 ? 0.68 : 0.82
     ctx.fill()
   }
   ctx.globalAlpha = 1
@@ -183,8 +192,8 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
 
   // Labels
   if (showL || sc > 9) {
-    const thresh = sc > 22 ? 0.06 : sc > 14 ? 0.25 : sc > 9 ? 0.48 : 0.65
-    const cap    = sc > 22 ? 150  : sc > 14 ? 60   : sc > 9  ? 22   : 10
+    const thresh = showL ? (sc > 18 ? 0.16 : sc > 10 ? 0.34 : 0.55) : (sc > 24 ? 0.28 : sc > 14 ? 0.48 : 0.70)
+    const cap    = showL ? (sc > 18 ? 90 : sc > 10 ? 42 : 18) : (sc > 24 ? 34 : sc > 14 ? 18 : 8)
     const labCls = cls.filter(c => (c._sizeRatio || 0) >= thresh && String(c.id) !== selId && String(c.id) !== hovId)
       .sort((a, b) => (b._sizeRatio || 0) - (a._sizeRatio || 0)).slice(0, cap)
 
@@ -195,7 +204,7 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
       const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
       if (px < -130 || px > w + 130 || py < -22 || py > h + 22) continue
       const r = Math.max((c._size || 0.5) * sc, 1)
-      const lbl = name.length > 26 ? name.slice(0, 26) + '…' : name
+      const lbl = shortLabel(name, 26)
       ctx.font = '9px Inter,system-ui,sans-serif'
       const tw = ctx.measureText(lbl).width
       roundRect(ctx, px - tw / 2 - 4, py + r + 3, tw + 8, 14, 3)
@@ -224,7 +233,7 @@ function project3D(x, y, z, rotX, rotY, fov, zoom) {
   return { sx: x1 * s * zoom, sy: -y2 * s * zoom, z: z2, s: s * zoom }
 }
 
-function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId) {
+function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId, showL) {
   ctx.fillStyle = BG3D; ctx.fillRect(0, 0, w, h)
 
   // Stars
@@ -271,6 +280,41 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId)
   }
   ctx.globalAlpha = 1
 
+
+
+  // Labels in 3D mode. The toggle must override zoom gating, while auto-labels still
+  // appear for the largest nearby clusters at high zoom.
+  if (showL || zoom > 7.5) {
+    const labelCap = showL ? (zoom > 12 ? 140 : 80) : 28
+    const labelThreshold = showL ? (zoom > 12 ? 0.08 : 0.20) : 0.55
+    const labelItems = items
+      .filter(item => item.r > 1.1 && (item.c._sizeRatio || 0) >= labelThreshold)
+      .sort((a, b) => (b.c._sizeRatio || 0) - (a.c._sizeRatio || 0))
+      .slice(0, labelCap)
+
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'top'
+    ctx.font = '9px Inter,system-ui,sans-serif'
+    for (const item of labelItems) {
+      const { c, px, py, r } = item
+      if (px < -120 || px > w + 120 || py < -28 || py > h + 28) continue
+      const name = c.display_name || c.medoid_label || c.cluster_id
+      if (!name) continue
+      const lbl = shortLabel(name, 28)
+      const tw = ctx.measureText(lbl).width
+      roundRect(ctx, px - tw / 2 - 5, py + r + 4, tw + 10, 15, 4)
+      ctx.fillStyle = 'rgba(3,6,16,0.82)'
+      ctx.fill()
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)'
+      ctx.lineWidth = 1
+      ctx.stroke()
+      ctx.fillStyle = 'rgba(226,232,240,0.90)'
+      ctx.fillText(lbl, px, py + r + 7)
+    }
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'alphabetic'
+  }
+
   // Focus on top
   if (focusItem) {
     const { c, px, py, r, isSel } = focusItem
@@ -287,6 +331,27 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId)
   }
 }
 
+function nearest3D(cls, mx, my, w, h, rotX, rotY, fov, zoom, panX, panY) {
+  let best = null
+  let bestScore = Infinity
+  for (const c of cls) {
+    const [ox, oy, oz] = c._pos
+    const { sx, sy, z, s } = project3D(ox, oy, oz, rotX, rotY, fov, zoom)
+    const px = w / 2 + panX + sx
+    const py = h / 2 + panY + sy
+    const r = Math.max((c._size || 0.5) * s * 0.9, 3)
+    const dx = px - mx
+    const dy = py - my
+    const d2 = dx * dx + dy * dy
+    const hitRadius = Math.max(10, r + 8)
+    if (d2 <= hitRadius * hitRadius && d2 < bestScore) {
+      bestScore = d2 + z * 0.002
+      best = c
+    }
+  }
+  return best
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 export default function SemanticScene({ clusters, colorMode, viewMode, showLabels }) {
   const {
@@ -297,6 +362,15 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
 
   const is3d = viewMode === '3d'
   const layoutMode = is3d ? 'galaxy' : 'map'
+
+  const layoutKey = useMemo(() => {
+    const list = clusters || []
+    if (!list.length) return 'empty'
+    const first = list[0]?.id || list[0]?.cluster_id || ''
+    const last = list[list.length - 1]?.id || list[list.length - 1]?.cluster_id || ''
+    const anomalyCount = list.reduce((n, c) => n + (c.is_true_anomaly_cluster ? 1 : 0), 0)
+    return `${viewMode}|${colorMode}|${list.length}|${anomalyCount}|${first}|${last}`
+  }, [clusters, viewMode, colorMode])
 
   const positioned = useMemo(
     () => clusters?.length ? buildSpatialLayout(clusters, { colorMode, viewMode: layoutMode }) : [],
@@ -310,6 +384,7 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
   const rafRef     = useRef(null)
   const dirtyRef   = useRef(true)
   const fitted2d   = useRef(false)
+  const lastFitKey = useRef('')
 
   const posRef   = useRef(positioned); posRef.current   = positioned
   const selRef   = useRef(selectedClusterId); selRef.current = selectedClusterId
@@ -317,8 +392,13 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
   const labRef   = useRef(showLabels);        labRef.current = showLabels
   const is3dRef  = useRef(is3d);             is3dRef.current = is3d
 
-  // Auto-fit 2D when data changes
+  // Auto-fit only when the actual dataset/view/filter signature changes.
+  // This prevents manual zoom from snapping back during normal re-renders.
   useEffect(() => {
+    dirtyRef.current = true
+    if (lastFitKey.current === layoutKey) return
+    lastFitKey.current = layoutKey
+
     if (is3d || !positioned.length) return
     const { w, h } = xf2d.current
     if (!w || !h) { fitted2d.current = false; return }
@@ -326,7 +406,7 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
     xf2d.current = { ...xf2d.current, ...fit }
     fitted2d.current = true
     dirtyRef.current = true
-  }, [positioned, is3d])
+  }, [positioned, is3d, layoutKey])
 
   // Camera reset
   useEffect(() => {
@@ -358,7 +438,7 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       const selId = selRef.current != null ? String(selRef.current) : null
       const hovId = hovRef.current != null ? String(hovRef.current) : null
-      draw3D(ctx, posRef.current, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId)
+      draw3D(ctx, posRef.current, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId, labRef.current)
     } else {
       const { tx, ty, sc, w, h } = xf2d.current
       if (!w || !h) return
@@ -491,11 +571,15 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
       dirtyRef.current = true
       return
     }
-    // Hover (2D only — 3D hover uses projected positions which requires a full pass)
-    if (is3dRef.current) return
     const canvas = canvasRef.current
     if (!canvas) return
     const rect = canvas.getBoundingClientRect()
+    if (is3dRef.current) {
+      const { rotX, rotY, fov, zoom, panX, panY, w, h } = xf3d.current
+      const hit = nearest3D(posRef.current, e.clientX - rect.left, e.clientY - rect.top, w, h, rotX, rotY, fov, zoom, panX, panY)
+      setHoveredClusterId(hit ? hit.id : null)
+      return
+    }
     const { tx, ty, sc, w, h } = xf2d.current
     const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
     const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
@@ -509,8 +593,13 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
     if (!wasDrag) {
       const canvas = canvasRef.current
       if (!canvas) return
-      if (!is3dRef.current) {
-        const rect = canvas.getBoundingClientRect()
+      const rect = canvas.getBoundingClientRect()
+      if (is3dRef.current) {
+        const { rotX, rotY, fov, zoom, panX, panY, w, h } = xf3d.current
+        const hit = nearest3D(posRef.current, e.clientX - rect.left, e.clientY - rect.top, w, h, rotX, rotY, fov, zoom, panX, panY)
+        if (hit) setSelectedClusterId(prev => String(prev) === String(hit.id) ? null : hit.id)
+        else setSelectedClusterId(null)
+      } else {
         const { tx, ty, sc, w, h } = xf2d.current
         const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
         const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
