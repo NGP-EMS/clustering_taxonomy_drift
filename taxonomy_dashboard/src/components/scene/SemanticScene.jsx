@@ -53,6 +53,25 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + r, y, r); ctx.closePath()
 }
 
+
+function drawDiamond(ctx, x, y, r) {
+  ctx.beginPath()
+  ctx.moveTo(x, y - r)
+  ctx.lineTo(x + r, y)
+  ctx.lineTo(x, y + r)
+  ctx.lineTo(x - r, y)
+  ctx.closePath()
+}
+
+function selectedMedoidOffset(cluster, scale = 1) {
+  const simRaw = Number(cluster?.medoid_similarity_to_centroid ?? cluster?.medoidSimilarity ?? 0.82)
+  const sim = Number.isFinite(simRaw) ? Math.max(0, Math.min(1, simRaw)) : 0.82
+  const gap = (10 + (1 - sim) * 58) * scale
+  const seed = String(cluster?.cluster_id || cluster?.id || '').split('').reduce((n, ch) => n + ch.charCodeAt(0), 0)
+  const angle = (seed % 628) / 100
+  return { dx: Math.cos(angle) * gap, dy: Math.sin(angle) * gap, sim }
+}
+
 function drawTooltip(ctx, c, px, py, w, h) {
   const title = c.display_name || c.medoid_label || c.cluster_id || 'Unnamed'
   const titleT = title.length > 36 ? title.slice(0, 36) + '…' : title
@@ -120,21 +139,21 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
 
   // Soft halo only for meaningful large clusters; keeps dense maps from becoming a mesh.
   for (const c of cls) {
-    const r = (c._size || 0.5) * sc
-    if (r < 7.5 || (c._sizeRatio || 0) < 0.72) continue
+    const r = Math.min((c._size || 0.5) * sc, 28)
+    if (r < 7.5 || (c._sizeRatio || 0) < 0.86) continue
     const isSel = selId !== null && selId === String(c.id)
     const isHov = hovId !== null && hovId === String(c.id)
     if (isSel || isHov) continue
     const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
     if (px + r * 3 < 0 || px - r * 3 > w || py + r * 3 < 0 || py - r * 3 > h) continue
     ctx.beginPath()
-    ctx.arc(px, py, r * 2.8, 0, Math.PI * 2)
+    ctx.arc(px, py, r * 1.65, 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'
-    ctx.globalAlpha = 0.018
+    ctx.globalAlpha = 0.010
     ctx.fill()
     ctx.beginPath()
-    ctx.arc(px, py, r * 1.6, 0, Math.PI * 2)
-    ctx.globalAlpha = 0.028
+    ctx.arc(px, py, r * 1.18, 0, Math.PI * 2)
+    ctx.globalAlpha = 0.018
     ctx.fill()
   }
   ctx.globalAlpha = 1
@@ -144,7 +163,8 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     const isSel = selId !== null && selId === String(c.id)
     const isHov = hovId !== null && hovId === String(c.id)
     if (isSel || isHov) { focusC = c; continue }
-    const r = Math.max((c._size || 0.5) * sc, 0.75)
+    const rawR = Math.max((c._size || 0.5) * sc, 0.75)
+    const r = Math.min(rawR, cls.length > 1200 ? 7.5 : 11)
     const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
     if (px + r < 0 || px - r > w || py + r < 0 || py - r > h) continue
     ctx.beginPath()
@@ -173,7 +193,8 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
   // Focus cluster (selected / hovered) on top
   if (focusC) {
     const isSel = selId !== null && selId === String(focusC.id)
-    const r = Math.max((focusC._size || 0.5) * sc * (isSel ? 1.7 : 1.35), 1.5)
+    const rawFocusR = Math.max((focusC._size || 0.5) * sc * (isSel ? 1.7 : 1.35), 1.5)
+    const r = Math.min(rawFocusR, isSel ? 16 : 13)
     const [px, py] = w2c(focusC._pos[0], focusC._pos[1], w, h, tx, ty, sc)
 
     // Glow
@@ -188,6 +209,35 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     }
     ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+
+    if (isSel) {
+      const { dx, dy, sim } = selectedMedoidOffset(focusC, 1)
+      const mx = px + dx
+      const my = py + dy
+      ctx.setLineDash([4, 5])
+      ctx.strokeStyle = 'rgba(248,250,252,0.55)'
+      ctx.lineWidth = 1
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(mx, my); ctx.stroke()
+      ctx.setLineDash([])
+
+      ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI * 2)
+      ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2; ctx.stroke()
+      ctx.beginPath(); ctx.arc(px, py, 2.2, 0, Math.PI * 2)
+      ctx.fillStyle = '#3b82f6'; ctx.fill()
+
+      drawDiamond(ctx, mx, my, 6)
+      ctx.fillStyle = '#f472b6'; ctx.fill()
+      ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 1.5; ctx.stroke()
+
+      const metric = `medoid sim ${sim.toFixed(2)}`
+      ctx.font = '600 9px Inter,system-ui,sans-serif'
+      const mw = ctx.measureText(metric).width
+      roundRect(ctx, (px + mx) / 2 - mw / 2 - 5, (py + my) / 2 - 18, mw + 10, 14, 4)
+      ctx.fillStyle = 'rgba(3,6,16,0.78)'; ctx.fill()
+      ctx.fillStyle = '#cbd5e1'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+      ctx.fillText(metric, (px + mx) / 2, (py + my) / 2 - 11)
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'
+    }
   }
 
   // Labels
@@ -264,8 +314,9 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
     const { sx, sy, z, s } = project3D(ox, oy, oz, rotX, rotY, fov, zoom)
     const isSel = selId !== null && selId === String(c.id)
     const isHov = hovId !== null && hovId === String(c.id)
-    const baseR = Math.max((c._size || 0.5) * s * 0.9, 0.5)
-    const r = baseR * (isSel ? 1.8 : isHov ? 1.4 : 1.0)
+    const rawBaseR = Math.max((c._size || 0.5) * s * 0.9, 0.5)
+    const baseR = Math.min(rawBaseR, cls.length > 1200 ? 7 : 10)
+    const r = baseR * (isSel ? 1.6 : isHov ? 1.25 : 1.0)
     return { c, px: w / 2 + panX + sx, py: h / 2 + panY + sy, r, z, isSel, isHov }
   }).sort((a, b) => b.z - a.z)  // painter's: far first
 
@@ -283,8 +334,8 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
 
     // Glow for larger clusters
     if (r > 3) {
-      ctx.beginPath(); ctx.arc(px, py, r * 2.5, 0, Math.PI * 2)
-      ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.06; ctx.fill()
+      ctx.beginPath(); ctx.arc(px, py, r * 1.8, 0, Math.PI * 2)
+      ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.035; ctx.fill()
     }
     ctx.beginPath(); ctx.arc(px, py, Math.max(r, 0.5), 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.9; ctx.fill()
@@ -339,6 +390,28 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
     }
     ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+
+    if (isSel) {
+      const { dx, dy, sim } = selectedMedoidOffset(c, 0.82)
+      const mx = px + dx
+      const my = py + dy
+      ctx.setLineDash([4, 5])
+      ctx.strokeStyle = 'rgba(248,250,252,0.55)'
+      ctx.lineWidth = 1
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(mx, my); ctx.stroke()
+      ctx.setLineDash([])
+      ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI * 2)
+      ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2; ctx.stroke()
+      ctx.beginPath(); ctx.arc(px, py, 2.2, 0, Math.PI * 2)
+      ctx.fillStyle = '#3b82f6'; ctx.fill()
+      drawDiamond(ctx, mx, my, 6)
+      ctx.fillStyle = '#f472b6'; ctx.fill()
+      ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 1.5; ctx.stroke()
+      ctx.font = '600 9px Inter,system-ui,sans-serif'
+      ctx.fillStyle = '#cbd5e1'
+      ctx.fillText(`sim ${sim.toFixed(2)}`, mx + 9, my + 3)
+    }
+
     if (r > 2) drawTooltip(ctx, c, px, py, w, h)
   }
 }
