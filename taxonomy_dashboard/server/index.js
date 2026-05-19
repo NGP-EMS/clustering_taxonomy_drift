@@ -14,6 +14,7 @@ app.use(express.json());
 
 // ── Schema cache ───────────────────────────────────────────────────────────────
 const _colCache = {};
+const _tableCache = {};
 
 async function getCols(tableName) {
   if (_colCache[tableName]) return _colCache[tableName];
@@ -24,6 +25,13 @@ async function getCols(tableName) {
   );
   _colCache[tableName] = new Set(rows.map(r => r.column_name));
   return _colCache[tableName];
+}
+
+async function tableExists(tableName) {
+  if (_tableCache[tableName] === true) return true;
+  const { rows } = await pool.query(`SELECT to_regclass($1) IS NOT NULL AS exists`, [`public.${tableName}`]);
+  _tableCache[tableName] = !!rows[0]?.exists;
+  return _tableCache[tableName];
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -40,6 +48,34 @@ function anomalyColSql(tcCols, alias = 'tc') {
   return null;
 }
 
+function parseEmbedding(value) {
+  if (!value) return null;
+  const arr = Array.isArray(value) ? value : typeof value === 'string' ? JSON.parse(value) : null;
+  if (!Array.isArray(arr) || !arr.length) return null;
+  return arr.map(Number).filter(Number.isFinite);
+}
+
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return null;
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (!na || !nb) return null;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+function similarityInterpretation(score, sameField, isAnomaly) {
+  if (score == null) return 'not computed';
+  if (isAnomaly && score >= 0.82) return 'anomaly recovery candidate';
+  if (sameField && score >= 0.9) return 'merge candidate';
+  if (score >= 0.82) return 'semantic neighbor';
+  if (score >= 0.72) return 'weak semantic neighbor';
+  return 'distant neighborhood';
+}
+
 // ── Cluster list query builder ─────────────────────────────────────────────────
 async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   const [tcCols, tcnCols, lmCols] = await Promise.all([
@@ -47,6 +83,7 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
     getCols('taxonomy_cluster_names'),
     getCols('taxonomy_label_cluster_map'),
   ]);
+  const hasProjectionCoordinates = await tableExists('semantic_projection_coordinates');
 
   const vals = [];
   const cond = [];
@@ -68,8 +105,25 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
     const parts = [`tc.cluster_id ILIKE $${idx}`];
     if (tcCols.has('medoid_label'))         parts.push(`tc.medoid_label ILIKE $${idx}`);
     if (tcCols.has('representative_label')) parts.push(`tc.representative_label ILIKE $${idx}`);
+    if (tcCols.has('representative_labels')) parts.push(`tc.representative_labels::text ILIKE $${idx}`);
     if (tcnCols.has('display_name'))        parts.push(`tcn.display_name ILIKE $${idx}`);
+    const lmClusterColSearch = lmCols.has('final_cluster_id') ? 'final_cluster_id' : 'cluster_id';
+    const lmSearchParts = [];
+    if (lmCols.has('raw_label')) lmSearchParts.push(`lm_search.raw_label ILIKE $${idx}`);
+    if (lmCols.has('normalized_label')) lmSearchParts.push(`lm_search.normalized_label ILIKE $${idx}`);
+    if (lmSearchParts.length) {
+      let exists = `EXISTS (SELECT 1 FROM taxonomy_label_cluster_map lm_search WHERE lm_search.${lmClusterColSearch} = tc.cluster_id`;
+      if (lmCols.has('field_name')) exists += ' AND lm_search.field_name = tc.field_name';
+      if (lmCols.has('run_id') && tcCols.has('run_id')) exists += ' AND lm_search.run_id = tc.run_id';
+      exists += ` AND (${lmSearchParts.join(' OR ')}))`;
+      parts.push(exists);
+    }
     cond.push(`(${parts.join(' OR ')})`);
+  }
+
+  if (filters.min_size && tcCols.has('cluster_size')) {
+    vals.push(parseInt(filters.min_size, 10) || 1);
+    cond.push(`tc.cluster_size >= $${vals.length}`);
   }
 
   if (!anomalyOnly) {
@@ -78,8 +132,13 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   }
 
   const whereClause = cond.length ? `WHERE ${cond.join(' AND ')}` : '';
-  const limit  = Math.min(Math.max(parseInt(filters.limit)  || 50, 1), 1000);
+  const limit  = Math.min(Math.max(parseInt(filters.limit)  || 50, 1), 5000);
   const offset = Math.max(parseInt(filters.offset) || 0, 0);
+  const projectionMethod = ['umap', 'tsne', 'pca'].includes(String(filters.projection || '').toLowerCase())
+    ? String(filters.projection).toLowerCase()
+    : 'umap';
+  if (hasProjectionCoordinates) vals.push(projectionMethod);
+  const projectionParam = hasProjectionCoordinates ? `$${vals.length}` : null;
   vals.push(limit);  const limitParam  = `$${vals.length}`;
   vals.push(offset); const offsetParam = `$${vals.length}`;
 
@@ -88,8 +147,14 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
     occ:     tcCols.has('total_occurrences')    ? 'tc.total_occurrences'    : 'NULL::bigint AS total_occurrences',
     medoid:  tcCols.has('medoid_label')         ? 'tc.medoid_label'         : 'NULL::text AS medoid_label',
     rep:     tcCols.has('representative_label') ? 'tc.representative_label' : 'NULL::text AS representative_label',
+    reps:    tcCols.has('representative_labels') ? 'tc.representative_labels::text AS representative_labels' : 'NULL::text AS representative_labels',
+    embedding: tcCols.has('centroid_embedding') ? 'tc.centroid_embedding::text AS centroid_embedding' : 'NULL::text AS centroid_embedding',
+    medoidSim: tcCols.has('medoid_similarity_to_centroid') ? 'tc.medoid_similarity_to_centroid' : 'NULL::numeric AS medoid_similarity_to_centroid',
     anomaly: aCol ? `${aCol} AS is_true_anomaly_cluster`                    : 'NULL::boolean AS is_true_anomaly_cluster',
     reason:  tcnCols.has('naming_reason')       ? 'tcn.naming_reason'       : 'NULL::text AS naming_reason',
+    centroid: tcCols.has('centroid_embedding') ? 'CASE WHEN tc.centroid_embedding IS NOT NULL THEN true ELSE false END AS has_centroid'
+      : tcCols.has('centroid') ? 'CASE WHEN tc.centroid IS NOT NULL THEN true ELSE false END AS has_centroid'
+      : 'NULL::boolean AS has_centroid',
   };
 
   const lmClusterCol = lmCols.has('final_cluster_id') ? 'final_cluster_id' : 'cluster_id';
@@ -100,23 +165,42 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   let lmJoinOn = `lm_sub.${lmClusterCol} = tc.cluster_id`;
   if (lmCols.has('field_name'))                     lmJoinOn += ' AND lm_sub.field_name = tc.field_name';
   if (lmCols.has('run_id') && tcCols.has('run_id')) lmJoinOn += ' AND lm_sub.run_id = tc.run_id';
+  const runIdExpr = tcCols.has('run_id') ? `COALESCE(tc.run_id, '')` : `''`;
+  const clusterVersionExpr = tcCols.has('cluster_version') ? `COALESCE(tc.cluster_version,'v1')` : `'v1'`;
+
+  const projectionSelect = hasProjectionCoordinates
+    ? `spc.projection_method, spc.x AS projection_x, spc.y AS projection_y, spc.z AS projection_z`
+    : `'fallback'::text AS projection_method, NULL::double precision AS projection_x, NULL::double precision AS projection_y, NULL::double precision AS projection_z`;
+
+  const projectionJoin = hasProjectionCoordinates
+    ? `LEFT JOIN semantic_projection_coordinates spc
+        ON spc.field_name = tc.field_name
+       AND spc.cluster_id = tc.cluster_id
+       AND spc.projection_method = ${projectionParam}
+       AND COALESCE(spc.run_id, '') = ${runIdExpr}`
+    : '';
 
   const sql = `
     SELECT
       tc.id,
       tc.field_name,
-      COALESCE(tc.run_id, '')          AS run_id,
-      COALESCE(tc.cluster_version,'v1') AS cluster_version,
+      ${runIdExpr} AS run_id,
+      ${clusterVersionExpr} AS cluster_version,
       tc.cluster_id,
       ${sel.size},
       ${sel.occ},
       ${sel.medoid},
+      ${sel.medoidSim},
       ${sel.rep},
+      ${sel.reps},
+      ${sel.embedding},
       ${sel.anomaly},
+      ${sel.centroid},
       tcn.display_name,
       tcn.naming_method,
       ${sel.reason},
-      COALESCE(lm_sub.label_count, 0) AS label_count
+      COALESCE(lm_sub.label_count, 0) AS label_count,
+      ${projectionSelect}
     FROM taxonomy_clusters tc
     LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
     LEFT JOIN (
@@ -124,6 +208,7 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
       FROM taxonomy_label_cluster_map
       GROUP BY ${lmGroupCols.join(', ')}
     ) lm_sub ON ${lmJoinOn}
+    ${projectionJoin}
     ${whereClause}
     ORDER BY tc.field_name, tc.cluster_id
     LIMIT ${limitParam} OFFSET ${offsetParam}
@@ -229,7 +314,8 @@ app.get('/api/clusters', async (req, res) => {
     const filters = {
       field_name: req.query.field_name || '', search: req.query.search || '',
       anomaly: req.query.anomaly || '', named: req.query.named || '',
-      limit: req.query.limit || 50, offset: req.query.offset || 0,
+      min_size: req.query.min_size || '', limit: req.query.limit || 50, offset: req.query.offset || 0,
+      projection: req.query.projection || 'umap',
     };
     const { sql, vals } = await buildClusterQuery({ filters });
     const { rows } = await pool.query(sql, vals);
@@ -243,6 +329,7 @@ app.get('/api/anomalies', async (req, res) => {
     const filters = {
       field_name: req.query.field_name || '', search: req.query.search || '',
       limit: req.query.limit || 50, offset: req.query.offset || 0,
+      projection: req.query.projection || 'umap',
     };
     const { sql, vals } = await buildClusterQuery({ filters, anomalyOnly: true });
     const { rows } = await pool.query(sql, vals);
@@ -268,11 +355,14 @@ app.get('/api/cluster/:id', async (req, res) => {
         ${tcCols.has('cluster_size')         ? 'tc.cluster_size'         : 'NULL::int AS cluster_size'},
         ${tcCols.has('total_occurrences')    ? 'tc.total_occurrences'    : 'NULL::bigint AS total_occurrences'},
         ${tcCols.has('medoid_label')         ? 'tc.medoid_label'         : 'NULL::text AS medoid_label'},
+        ${tcCols.has('medoid_similarity_to_centroid') ? 'tc.medoid_similarity_to_centroid' : 'NULL::numeric AS medoid_similarity_to_centroid'},
+        ${tcCols.has('representative_label')  ? 'tc.representative_label'  : 'NULL::text AS representative_label'},
+        ${tcCols.has('representative_labels') ? 'tc.representative_labels::text' : 'NULL::text AS representative_labels'},
         ${tcCols.has('cluster_source')       ? 'tc.cluster_source'       : 'NULL::text AS cluster_source'},
         ${tcCols.has('similarity_threshold') ? 'tc.similarity_threshold' : 'NULL::numeric AS similarity_threshold'},
         ${tcCols.has('active')               ? 'tc.active'               : 'true AS active'},
         ${aCol ? `${aCol} AS is_true_anomaly_cluster` : 'NULL::boolean AS is_true_anomaly_cluster'},
-        ${tcCols.has('centroid_embedding') ? 'CASE WHEN tc.centroid_embedding IS NOT NULL THEN true ELSE false END' : 'false'} AS has_centroid,
+        ${tcCols.has('centroid_embedding') ? 'CASE WHEN tc.centroid_embedding IS NOT NULL THEN true ELSE false END' : tcCols.has('centroid') ? 'CASE WHEN tc.centroid IS NOT NULL THEN true ELSE false END' : 'false'} AS has_centroid,
         tc.created_at,
         tcn.display_name, tcn.naming_method,
         ${tcnCols.has('naming_reason') ? 'tcn.naming_reason' : 'NULL::text AS naming_reason'}
@@ -330,28 +420,75 @@ app.get('/api/cluster/:id/similar', async (req, res) => {
     if (isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
 
     const { rows: [cluster] } = await pool.query(
-      'SELECT field_name, cluster_id FROM taxonomy_clusters WHERE id = $1', [id]
+      'SELECT id, field_name, cluster_id, is_true_anomaly_cluster, centroid_embedding FROM taxonomy_clusters WHERE id = $1', [id]
     );
     if (!cluster) return res.status(404).json({ error: 'Cluster not found' });
 
     const [tcCols, tcnCols] = await Promise.all([getCols('taxonomy_clusters'), getCols('taxonomy_cluster_names')]);
     const aCol = anomalyColSql(tcCols);
+    const targetEmbedding = parseEmbedding(cluster.centroid_embedding);
+
+    if (!tcCols.has('centroid_embedding') || !targetEmbedding) {
+      return res.json({
+        status: 'not_computed',
+        reason: 'Centroid embedding is missing or not queryable for this cluster.',
+        neighbors: [],
+      });
+    }
 
     const { rows } = await pool.query(`
       SELECT
         tc.id, tc.field_name, tc.cluster_id,
         ${tcCols.has('cluster_size')  ? 'tc.cluster_size'  : 'NULL::int AS cluster_size'},
+        ${tcCols.has('total_occurrences') ? 'tc.total_occurrences' : 'NULL::bigint AS total_occurrences'},
         ${tcCols.has('medoid_label')  ? 'tc.medoid_label'  : 'NULL::text AS medoid_label'},
+        ${tcCols.has('medoid_similarity_to_centroid') ? 'tc.medoid_similarity_to_centroid' : 'NULL::numeric AS medoid_similarity_to_centroid'},
         ${aCol ? `${aCol} AS is_true_anomaly_cluster` : 'NULL::boolean AS is_true_anomaly_cluster'},
-        tcn.display_name, tcn.naming_method
+        tc.centroid_embedding,
+        COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name,
+        tcn.naming_method
       FROM taxonomy_clusters tc
       LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
-      WHERE tc.field_name = $1 AND tc.id != $2
-        ${aCol ? `AND (${aCol} = false OR ${aCol} IS NULL)` : ''}
-      ORDER BY ${tcCols.has('cluster_size') ? 'tc.cluster_size DESC' : 'tc.cluster_id'}
-      LIMIT $3
-    `, [cluster.field_name, id, lim]);
-    res.json(rows);
+      WHERE tc.id != $1
+        AND tc.centroid_embedding IS NOT NULL
+      ORDER BY (tc.field_name = $2) DESC, ${tcCols.has('cluster_size') ? 'tc.cluster_size DESC NULLS LAST' : 'tc.id'}
+      LIMIT 8000
+    `, [id, cluster.field_name]);
+
+    const neighbors = rows
+      .map(r => {
+        const score = cosineSimilarity(targetEmbedding, parseEmbedding(r.centroid_embedding));
+        const sameField = r.field_name === cluster.field_name;
+        return {
+          id: r.id,
+          field_name: r.field_name,
+          cluster_id: r.cluster_id,
+          display_name: r.display_name,
+          cluster_size: r.cluster_size,
+          total_occurrences: r.total_occurrences,
+          medoid_label: r.medoid_label,
+          medoid_similarity_to_centroid: r.medoid_similarity_to_centroid,
+          is_true_anomaly_cluster: r.is_true_anomaly_cluster,
+          cosine_similarity: score == null ? null : +score.toFixed(4),
+          same_field: sameField,
+          interpretation: similarityInterpretation(score, sameField, cluster.is_true_anomaly_cluster),
+        };
+      })
+      .filter(r => r.cosine_similarity != null)
+      .sort((a, b) => b.cosine_similarity - a.cosine_similarity)
+      .slice(0, lim);
+
+    const avg = neighbors.length
+      ? neighbors.reduce((s, n) => s + n.cosine_similarity, 0) / neighbors.length
+      : null;
+
+    res.json({
+      status: 'computed',
+      metric: 'centroid_cosine_similarity',
+      explanation: 'Analytical nearest-neighbor hints derived from centroid embeddings. These are not official taxonomy relationships.',
+      avg_neighbor_similarity: avg == null ? null : +avg.toFixed(4),
+      neighbors,
+    });
   } catch (err) { console.error('/api/cluster/:id/similar:', err.message); res.status(500).json({ error: err.message }); }
 });
 
@@ -421,6 +558,27 @@ app.get('/api/anomaly-intelligence', async (req, res) => {
     if (lmCols.has('run_id') && tcCols.has('run_id')) lmOn += ' AND lm_sub.run_id = tc.run_id';
     const sizeExpr = tcCols.has('cluster_size') ? 'tc.cluster_size' : '1';
 
+    const { rows: overviewRows } = await pool.query(`
+      SELECT
+        tc.field_name,
+        COUNT(*)::int AS anomaly_clusters,
+        COALESCE(SUM(${tcCols.has('cluster_size') ? 'tc.cluster_size' : '1'}), 0)::bigint AS anomaly_labels,
+        COALESCE(SUM(${tcCols.has('total_occurrences') ? 'tc.total_occurrences' : tcCols.has('cluster_size') ? 'tc.cluster_size' : '1'}), 0)::bigint AS anomaly_occurrences
+      FROM taxonomy_clusters tc
+      WHERE ${aCol} = true
+      GROUP BY tc.field_name
+      ORDER BY anomaly_clusters DESC
+    `);
+
+    const { rows: totalRows } = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total_clusters,
+        COUNT(*) FILTER (WHERE ${aCol} = true)::int AS anomaly_clusters,
+        COALESCE(SUM(${tcCols.has('cluster_size') ? 'tc.cluster_size' : '1'}) FILTER (WHERE ${aCol} = true), 0)::bigint AS anomaly_labels,
+        COALESCE(SUM(${tcCols.has('total_occurrences') ? 'tc.total_occurrences' : tcCols.has('cluster_size') ? 'tc.cluster_size' : '1'}) FILTER (WHERE ${aCol} = true), 0)::bigint AS anomaly_occurrences
+      FROM taxonomy_clusters tc
+    `);
+
     const { rows } = await pool.query(`
       SELECT
         tc.id, tc.field_name,
@@ -429,6 +587,7 @@ app.get('/api/anomaly-intelligence', async (req, res) => {
         ${tcCols.has('cluster_size')      ? 'tc.cluster_size'      : 'NULL::int AS cluster_size'},
         ${tcCols.has('total_occurrences') ? 'tc.total_occurrences' : 'NULL::bigint AS total_occurrences'},
         ${tcCols.has('medoid_label')      ? 'tc.medoid_label'      : 'NULL::text AS medoid_label'},
+        ${tcCols.has('representative_labels') ? 'tc.representative_labels::text' : 'NULL::text AS representative_labels'},
         ${tcCols.has('cluster_source')    ? 'tc.cluster_source'    : 'NULL::text AS cluster_source'},
         ${aCol} AS is_true_anomaly_cluster,
         tcn.display_name, tcn.naming_method,
@@ -452,7 +611,24 @@ app.get('/api/anomaly-intelligence', async (req, res) => {
     `);
 
     const byType = rows.reduce((acc, r) => { acc[r.anomaly_type] = (acc[r.anomaly_type] || 0) + 1; return acc; }, {});
-    res.json({ clusters: rows, summary: { total: rows.length, by_type: byType } });
+    const totals = totalRows[0] || {};
+    res.json({
+      clusters: rows.map(r => ({
+        ...r,
+        recoverability_status: 'not_computed',
+        nearest_cluster_candidates: [],
+        suggested_action: 'review manually',
+      })),
+      summary: {
+        total: totals.anomaly_clusters || rows.length,
+        total_clusters: totals.total_clusters || null,
+        anomaly_labels: Number(totals.anomaly_labels) || 0,
+        anomaly_occurrences: Number(totals.anomaly_occurrences) || 0,
+        anomaly_rate: totals.total_clusters ? Number(totals.anomaly_clusters || 0) / Number(totals.total_clusters) : null,
+        by_type: byType,
+        by_field: overviewRows,
+      },
+    });
   } catch (err) { console.error('/api/anomaly-intelligence:', err.message); res.status(500).json({ error: err.message }); }
 });
 

@@ -1,155 +1,527 @@
-import { Suspense, useEffect, useRef, useMemo } from 'react'
-import { Canvas, useFrame } from '@react-three/fiber'
-import { OrbitControls, Stars, Grid } from '@react-three/drei'
-import * as THREE from 'three'
+import { useRef, useEffect, useMemo, useCallback } from 'react'
 import useStore from '../../store/useStore.js'
-import ClusterCloud from './ClusterCloud.jsx'
-import SceneAxes from './SceneAxes.jsx'
-import AmbientParticles from './AmbientParticles.jsx'
-import { buildSpatialLayout } from './sceneUtils.js'
+import { buildSpatialLayout, seededRand } from './sceneUtils.js'
 
-// Slow-breathing nebula fog shell — wraps the whole semantic universe
-function NebulaFog() {
-  const ref = useRef()
-  useFrame(({ clock }) => {
-    if (!ref.current) return
-    ref.current.material.opacity = 0.035 + Math.sin(clock.getElapsedTime() * 0.22) * 0.012
-  })
-  return (
-    <mesh ref={ref}>
-      <sphereGeometry args={[260, 32, 32]} />
-      <meshBasicMaterial
-        color="#040b1a"
-        transparent
-        opacity={0.04}
-        side={THREE.BackSide}
-        depthWrite={false}
-      />
-    </mesh>
-  )
+// ── Constants ──────────────────────────────────────────────────────────────────
+const BG2D = '#080e1a'
+const BG3D = '#030610'
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function w2c(wx, wy, w, h, tx, ty, sc) {
+  return [w / 2 + wx * sc + tx, h / 2 - wy * sc + ty]
+}
+function c2w(cx, cy, w, h, tx, ty, sc) {
+  return [(cx - w / 2 - tx) / sc, -(cy - h / 2 - ty) / sc]
 }
 
-function SceneContent({ clusters, selectedId, hoveredId, onHover, onClick, showLabels, renderMode }) {
-  const cameraReset = useStore(s => s.cameraReset)
-  const controlRef  = useRef()
+function fitAll(cls, w, h) {
+  if (!cls.length) return { tx: 0, ty: 0, sc: 5 }
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+  for (const c of cls) {
+    x0 = Math.min(x0, c._pos[0]); x1 = Math.max(x1, c._pos[0])
+    y0 = Math.min(y0, c._pos[1]); y1 = Math.max(y1, c._pos[1])
+  }
+  const sc = Math.min(w * 0.80 / ((x1 - x0) || 1), h * 0.80 / ((y1 - y0) || 1), 60)
+  return { tx: -((x0 + x1) / 2) * sc, ty: ((y0 + y1) / 2) * sc, sc }
+}
 
-  useEffect(() => {
-    if (controlRef.current) {
-      controlRef.current.target.set(0, 0, 0)
-      controlRef.current.object.position.set(0, 55, 130)
-      controlRef.current.update()
+function nearest2D(cls, wx, wy, hitWU) {
+  let best = null, bd2 = hitWU * hitWU
+  for (const c of cls) {
+    const dx = c._pos[0] - wx, dy = c._pos[1] - wy
+    const d2 = dx * dx + dy * dy
+    if (d2 < bd2) { bd2 = d2; best = c }
+  }
+  return best
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y)
+  ctx.arcTo(x + w, y, x + w, y + r, r); ctx.lineTo(x + w, y + h - r)
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r); ctx.lineTo(x + r, y + h)
+  ctx.arcTo(x, y + h, x, y + h - r, r); ctx.lineTo(x, y + r)
+  ctx.arcTo(x, y, x + r, y, r); ctx.closePath()
+}
+
+function drawTooltip(ctx, c, px, py, w, h) {
+  const title = c.display_name || c.medoid_label || c.cluster_id || 'Unnamed'
+  const titleT = title.length > 36 ? title.slice(0, 36) + '…' : title
+  const sub = `${(c.cluster_size || 0).toLocaleString()} items · ${c.field_name || ''}`
+  ctx.save()
+  ctx.font = '600 11px Inter,system-ui,sans-serif'
+  const tw = Math.max(ctx.measureText(titleT).width, ctx.measureText(sub).width)
+  const bw = tw + 26, bh = 50, br = 6
+  let bx = px + 14, by = py - bh - 10
+  if (bx + bw > w - 8) bx = px - bw - 14
+  if (by < 8) by = py + 12
+  roundRect(ctx, bx, by, bw, bh, br)
+  ctx.fillStyle = 'rgba(6,10,20,0.97)'; ctx.fill()
+  ctx.strokeStyle = 'rgba(255,255,255,0.09)'; ctx.lineWidth = 1; ctx.stroke()
+  const accent = c._fieldColor || c._color || '#6366f1'
+  roundRect(ctx, bx, by, 3, bh, [br, 0, 0, br])
+  ctx.fillStyle = accent; ctx.fill()
+  ctx.font = 'bold 8px Inter,system-ui,sans-serif'
+  ctx.fillStyle = accent
+  ctx.fillText((c.field_name || '').toUpperCase(), bx + 12, by + 13)
+  ctx.font = '600 11px Inter,system-ui,sans-serif'
+  ctx.fillStyle = '#e2e8f0'
+  ctx.fillText(titleT, bx + 12, by + 29)
+  ctx.font = '400 9.5px Inter,system-ui,sans-serif'
+  ctx.fillStyle = '#64748b'
+  ctx.fillText(sub, bx + 12, by + 43)
+  ctx.restore()
+}
+
+// ── 2D draw ────────────────────────────────────────────────────────────────────
+function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
+  ctx.fillStyle = BG2D
+  ctx.fillRect(0, 0, w, h)
+
+  // Vignette
+  const vg = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.25, w / 2, h / 2, Math.max(w, h) * 0.78)
+  vg.addColorStop(0, 'rgba(0,0,0,0)')
+  vg.addColorStop(1, 'rgba(0,0,0,0.52)')
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, w, h)
+
+  // Grid
+  const step = 20 * sc
+  if (step > 5) {
+    const ox = ((w / 2 + tx) % step + step) % step
+    const oy = ((h / 2 + ty) % step + step) % step
+    ctx.strokeStyle = 'rgba(22,38,72,0.55)'; ctx.lineWidth = 0.5
+    ctx.beginPath()
+    for (let x = ox; x < w + step; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, h) }
+    for (let y = oy; y < h + step; y += step) { ctx.moveTo(0, y); ctx.lineTo(w, y) }
+    ctx.stroke()
+  }
+  // Major grid
+  const mstep = 100 * sc
+  if (mstep > 10 && mstep < w * 3) {
+    const ox = ((w / 2 + tx) % mstep + mstep) % mstep
+    const oy = ((h / 2 + ty) % mstep + mstep) % mstep
+    ctx.strokeStyle = 'rgba(30,55,100,0.3)'; ctx.lineWidth = 0.8
+    ctx.beginPath()
+    for (let x = ox; x < w + mstep; x += mstep) { ctx.moveTo(x, 0); ctx.lineTo(x, h) }
+    for (let y = oy; y < h + mstep; y += mstep) { ctx.moveTo(0, y); ctx.lineTo(w, y) }
+    ctx.stroke()
+  }
+
+  let focusC = null
+
+  // Glow pass for large clusters
+  for (const c of cls) {
+    const r = (c._size || 0.5) * sc
+    if (r < 3.5) continue
+    const isSel = selId !== null && selId === String(c.id)
+    const isHov = hovId !== null && hovId === String(c.id)
+    if (isSel || isHov) continue
+    const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
+    if (px + r * 3 < 0 || px - r * 3 > w || py + r * 3 < 0 || py - r * 3 > h) continue
+    ctx.beginPath()
+    ctx.arc(px, py, r * 2.8, 0, Math.PI * 2)
+    ctx.fillStyle = c._color || '#6366f1'
+    ctx.globalAlpha = 0.04
+    ctx.fill()
+    ctx.beginPath()
+    ctx.arc(px, py, r * 1.6, 0, Math.PI * 2)
+    ctx.globalAlpha = 0.06
+    ctx.fill()
+  }
+  ctx.globalAlpha = 1
+
+  // Main clusters
+  for (const c of cls) {
+    const isSel = selId !== null && selId === String(c.id)
+    const isHov = hovId !== null && hovId === String(c.id)
+    if (isSel || isHov) { focusC = c; continue }
+    const r = Math.max((c._size || 0.5) * sc, 1)
+    const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
+    if (px + r < 0 || px - r > w || py + r < 0 || py - r > h) continue
+    ctx.beginPath()
+    ctx.arc(px, py, r, 0, Math.PI * 2)
+    ctx.fillStyle = c._color || '#6366f1'
+    ctx.globalAlpha = 0.88
+    ctx.fill()
+  }
+  ctx.globalAlpha = 1
+
+  // Neighbor lines for focus
+  if (focusC) {
+    const [fx, fy] = focusC._pos
+    const sorted = [...cls].filter(c => String(c.id) !== String(focusC.id))
+      .map(c => { const dx = c._pos[0] - fx, dy = c._pos[1] - fy; return { c, d2: dx * dx + dy * dy } })
+      .sort((a, b) => a.d2 - b.d2).slice(0, 6)
+    const [fpx, fpy] = w2c(fx, fy, w, h, tx, ty, sc)
+    ctx.strokeStyle = 'rgba(56,75,120,0.55)'; ctx.lineWidth = 0.8; ctx.setLineDash([3, 4])
+    for (const { c } of sorted) {
+      const [nx, ny] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
+      ctx.beginPath(); ctx.moveTo(fpx, fpy); ctx.lineTo(nx, ny); ctx.stroke()
     }
-  }, [cameraReset])
+    ctx.setLineDash([])
+  }
 
-  return (
-    <>
-      {/* Ambient + directional lighting tuned for the wider semantic universe */}
-      <ambientLight intensity={0.12} color="#081020" />
-      <pointLight position={[0,   0,   0]}  intensity={2.2} color="#152a50" distance={300} />
-      <pointLight position={[80,  30,  0]}  intensity={1.0} color="#00d4ff" distance={200} decay={1.5} />
-      <pointLight position={[-80,-20,  0]}  intensity={0.7} color="#7c3aed" distance={200} decay={1.5} />
-      <pointLight position={[0,  -40, 100]} intensity={0.5} color="#10b981" distance={180} decay={1.5} />
-      <pointLight position={[0,   40,-100]} intensity={0.4} color="#f97316" distance={180} decay={1.5} />
+  // Focus cluster (selected / hovered) on top
+  if (focusC) {
+    const isSel = selId !== null && selId === String(focusC.id)
+    const r = Math.max((focusC._size || 0.5) * sc * (isSel ? 1.7 : 1.35), 1.5)
+    const [px, py] = w2c(focusC._pos[0], focusC._pos[1], w, h, tx, ty, sc)
 
-      {/* Deep-space star field */}
-      <Stars radius={400} depth={120} count={6000} factor={5} saturation={0.25} fade speed={0.3} />
+    // Glow
+    ctx.beginPath(); ctx.arc(px, py, r * 3, 0, Math.PI * 2)
+    ctx.fillStyle = focusC._color || '#6366f1'; ctx.globalAlpha = 0.07; ctx.fill()
+    ctx.beginPath(); ctx.arc(px, py, r * 1.8, 0, Math.PI * 2); ctx.globalAlpha = 0.12; ctx.fill()
+    ctx.globalAlpha = 1
 
-      {/* Floor grid matching the new scale */}
-      <Grid
-        position={[0, -40, 0]}
-        args={[500, 500]}
-        cellSize={20}
-        cellThickness={0.2}
-        cellColor="#060e1e"
-        sectionSize={80}
-        sectionThickness={0.5}
-        sectionColor="#0b1830"
-        infiniteGrid
-        fadeDistance={350}
-        fadeStrength={2.5}
-      />
+    if (isSel) {
+      ctx.beginPath(); ctx.arc(px, py, r + 5, 0, Math.PI * 2)
+      ctx.strokeStyle = focusC._color || '#6366f1'; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.55; ctx.stroke(); ctx.globalAlpha = 1
+    }
+    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
+    ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+  }
 
-      <NebulaFog />
+  // Labels
+  if (showL || sc > 9) {
+    const thresh = sc > 22 ? 0.06 : sc > 14 ? 0.25 : sc > 9 ? 0.48 : 0.65
+    const cap    = sc > 22 ? 150  : sc > 14 ? 60   : sc > 9  ? 22   : 10
+    const labCls = cls.filter(c => (c._sizeRatio || 0) >= thresh && String(c.id) !== selId && String(c.id) !== hovId)
+      .sort((a, b) => (b._sizeRatio || 0) - (a._sizeRatio || 0)).slice(0, cap)
 
-      {/* Axes at the semantic core — clusters orbit them at 55–80 unit radius */}
-      <SceneAxes length={40} />
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top'
+    for (const c of labCls) {
+      const name = c.display_name || c.medoid_label
+      if (!name) continue
+      const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
+      if (px < -130 || px > w + 130 || py < -22 || py > h + 22) continue
+      const r = Math.max((c._size || 0.5) * sc, 1)
+      const lbl = name.length > 26 ? name.slice(0, 26) + '…' : name
+      ctx.font = '9px Inter,system-ui,sans-serif'
+      const tw = ctx.measureText(lbl).width
+      roundRect(ctx, px - tw / 2 - 4, py + r + 3, tw + 8, 14, 3)
+      ctx.fillStyle = 'rgba(6,10,20,0.72)'; ctx.fill()
+      ctx.fillStyle = 'rgba(148,163,184,0.9)'; ctx.fillText(lbl, px, py + r + 5)
+    }
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'
+  }
 
-      <AmbientParticles count={1200} />
-
-      {clusters.length > 0 && (
-        <ClusterCloud
-          clusters={clusters}
-          selectedId={selectedId}
-          hoveredId={hoveredId}
-          onHover={onHover}
-          onClick={onClick}
-          showLabels={showLabels}
-          renderMode={renderMode}
-        />
-      )}
-
-      <OrbitControls
-        ref={controlRef}
-        enableDamping
-        dampingFactor={0.055}
-        rotateSpeed={0.45}
-        zoomSpeed={0.7}
-        minDistance={8}
-        maxDistance={420}
-        autoRotate
-        autoRotateSpeed={0.10}
-      />
-    </>
-  )
+  if (focusC) {
+    const [px, py] = w2c(focusC._pos[0], focusC._pos[1], w, h, tx, ty, sc)
+    drawTooltip(ctx, focusC, px, py, w, h)
+  }
 }
 
-export default function SemanticScene({ clusters, showLabels, renderMode }) {
+// ── 3D draw ────────────────────────────────────────────────────────────────────
+function project3D(x, y, z, rotX, rotY, fov) {
+  // Rotate Y
+  const x1 = x * Math.cos(rotY) + z * Math.sin(rotY)
+  const z1 = -x * Math.sin(rotY) + z * Math.cos(rotY)
+  // Rotate X
+  const y2 = y * Math.cos(rotX) - z1 * Math.sin(rotX)
+  const z2 = y * Math.sin(rotX) + z1 * Math.cos(rotX)
+  // Perspective
+  const s = fov / Math.max(fov + z2, 8)
+  return { sx: x1 * s, sy: -y2 * s, z: z2, s }
+}
+
+function draw3D(ctx, cls, w, h, rotX, rotY, fov, selId, hovId) {
+  ctx.fillStyle = BG3D; ctx.fillRect(0, 0, w, h)
+
+  // Stars
+  ctx.fillStyle = '#ffffff'
+  for (let i = 0; i < 320; i++) {
+    const sx = seededRand(i * 17 + 3) * w
+    const sy = seededRand(i * 31 + 7) * h
+    const r  = 0.4 + seededRand(i * 43 + 11) * 0.9
+    ctx.globalAlpha = 0.15 + seededRand(i * 53 + 13) * 0.45
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill()
+  }
+  ctx.globalAlpha = 1
+
+  // Project all clusters
+  const items = cls.map(c => {
+    const [ox, oy, oz] = c._pos
+    const { sx, sy, z, s } = project3D(ox, oy, oz, rotX, rotY, fov)
+    const isSel = selId !== null && selId === String(c.id)
+    const isHov = hovId !== null && hovId === String(c.id)
+    const baseR = Math.max((c._size || 0.5) * s * 0.9, 0.5)
+    const r = baseR * (isSel ? 1.8 : isHov ? 1.4 : 1.0)
+    return { c, px: w / 2 + sx, py: h / 2 + sy, r, z, isSel, isHov }
+  }).sort((a, b) => b.z - a.z)  // painter's: far first
+
+  const maxZ = 80, minZ = -80
+  let focusItem = null
+
+  for (const item of items) {
+    const { c, px, py, r, z, isSel, isHov } = item
+    if (isSel || isHov) { focusItem = item; continue }
+    if (px + r < 0 || px - r > w || py + r < 0 || py - r > h) continue
+    if (r < 0.3) continue
+
+    const depth = (z - minZ) / (maxZ - minZ)
+    const alpha = 0.25 + Math.max(0, Math.min(1, depth)) * 0.65
+
+    // Glow for larger clusters
+    if (r > 3) {
+      ctx.beginPath(); ctx.arc(px, py, r * 2.5, 0, Math.PI * 2)
+      ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.06; ctx.fill()
+    }
+    ctx.beginPath(); ctx.arc(px, py, Math.max(r, 0.5), 0, Math.PI * 2)
+    ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.9; ctx.fill()
+  }
+  ctx.globalAlpha = 1
+
+  // Focus on top
+  if (focusItem) {
+    const { c, px, py, r, isSel } = focusItem
+    ctx.beginPath(); ctx.arc(px, py, r * 3, 0, Math.PI * 2)
+    ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = 0.1; ctx.fill()
+    ctx.globalAlpha = 1
+    if (isSel) {
+      ctx.beginPath(); ctx.arc(px, py, r + 5, 0, Math.PI * 2)
+      ctx.strokeStyle = c._color || '#6366f1'; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.6; ctx.stroke(); ctx.globalAlpha = 1
+    }
+    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
+    ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+    if (r > 2) drawTooltip(ctx, c, px, py, w, h)
+  }
+}
+
+// ── Component ──────────────────────────────────────────────────────────────────
+export default function SemanticScene({ clusters, colorMode, viewMode, showLabels }) {
   const {
-    selectedClusterId,
-    hoveredClusterId,
-    setHoveredClusterId,
-    setSelectedClusterId,
+    selectedClusterId, hoveredClusterId,
+    setHoveredClusterId, setSelectedClusterId,
+    cameraReset,
   } = useStore()
 
+  const is3d = viewMode === '3d'
+  const layoutMode = is3d ? 'galaxy' : 'map'
+
   const positioned = useMemo(
-    () => clusters?.length ? buildSpatialLayout(clusters) : [],
-    [clusters]
+    () => clusters?.length ? buildSpatialLayout(clusters, { colorMode, viewMode: layoutMode }) : [],
+    [clusters, colorMode, layoutMode]
   )
 
-  function handleHover(cluster) {
-    setHoveredClusterId(cluster ? (cluster.id ?? null) : null)
+  const canvasRef  = useRef(null)
+  const xf2d       = useRef({ tx: 0, ty: 0, sc: 5, w: 0, h: 0 })
+  const xf3d       = useRef({ rotX: 0.28, rotY: -0.45, fov: 200, w: 0, h: 0 })
+  const dragRef    = useRef({ on: false, sx: 0, sy: 0, stx: 0, sty: 0, srot: [0, 0], moved: false })
+  const rafRef     = useRef(null)
+  const dirtyRef   = useRef(true)
+  const fitted2d   = useRef(false)
+
+  const posRef   = useRef(positioned); posRef.current   = positioned
+  const selRef   = useRef(selectedClusterId); selRef.current = selectedClusterId
+  const hovRef   = useRef(hoveredClusterId);  hovRef.current = hoveredClusterId
+  const labRef   = useRef(showLabels);        labRef.current = showLabels
+  const is3dRef  = useRef(is3d);             is3dRef.current = is3d
+
+  // Auto-fit 2D when data changes
+  useEffect(() => {
+    if (is3d || !positioned.length) return
+    const { w, h } = xf2d.current
+    if (!w || !h) { fitted2d.current = false; return }
+    const fit = fitAll(positioned, w, h)
+    xf2d.current = { ...xf2d.current, ...fit }
+    fitted2d.current = true
+    dirtyRef.current = true
+  }, [positioned, is3d])
+
+  // Camera reset
+  useEffect(() => {
+    const { w, h } = is3d ? xf3d.current : xf2d.current
+    if (!w || !h) return
+    if (is3d) {
+      xf3d.current = { rotX: 0.28, rotY: -0.45, fov: 200, w, h }
+    } else {
+      if (posRef.current.length) {
+        const fit = fitAll(posRef.current, w, h)
+        xf2d.current = { ...xf2d.current, ...fit }
+      }
+    }
+    dirtyRef.current = true
+  }, [cameraReset, is3d])
+
+  // Mark dirty on reactive changes
+  useEffect(() => { dirtyRef.current = true }, [selectedClusterId, hoveredClusterId, showLabels, is3d])
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = window.devicePixelRatio || 1
+    const ctx = canvas.getContext('2d')
+
+    if (is3dRef.current) {
+      const { rotX, rotY, fov, w, h } = xf3d.current
+      if (!w || !h) return
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      const selId = selRef.current != null ? String(selRef.current) : null
+      const hovId = hovRef.current != null ? String(hovRef.current) : null
+      draw3D(ctx, posRef.current, w, h, rotX, rotY, fov, selId, hovId)
+    } else {
+      const { tx, ty, sc, w, h } = xf2d.current
+      if (!w || !h) return
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      const selId = selRef.current != null ? String(selRef.current) : null
+      const hovId = hovRef.current != null ? String(hovRef.current) : null
+      draw2D(ctx, posRef.current, w, h, tx, ty, sc, selId, hovId, labRef.current)
+    }
+
+    dirtyRef.current = false
+  }, [])
+
+  // RAF loop
+  useEffect(() => {
+    let alive = true
+    function tick() {
+      if (!alive) return
+      if (dirtyRef.current) draw()
+      rafRef.current = requestAnimationFrame(tick)
+    }
+    tick()
+    return () => { alive = false; cancelAnimationFrame(rafRef.current) }
+  }, [draw])
+
+  // Resize observer
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const parent = canvas.parentElement
+    if (!parent) return
+
+    function resize() {
+      const { width, height } = parent.getBoundingClientRect()
+      if (!width || !height) return
+      const dpr = window.devicePixelRatio || 1
+      canvas.width  = Math.round(width  * dpr)
+      canvas.height = Math.round(height * dpr)
+      canvas.style.width  = width  + 'px'
+      canvas.style.height = height + 'px'
+
+      const cls = posRef.current
+      if (!fitted2d.current && cls.length && !is3dRef.current) {
+        const fit = fitAll(cls, width, height)
+        xf2d.current = { ...fit, w: width, h: height }
+        fitted2d.current = true
+      } else {
+        xf2d.current = { ...xf2d.current, w: width, h: height }
+      }
+      xf3d.current = { ...xf3d.current, w: width, h: height }
+      dirtyRef.current = true
+    }
+
+    const ro = new ResizeObserver(resize)
+    ro.observe(parent)
+    resize()
+    return () => ro.disconnect()
+  }, [])
+
+  // Wheel zoom (passive: false)
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    function onWheel(e) {
+      e.preventDefault()
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
+      if (is3dRef.current) {
+        xf3d.current = { ...xf3d.current, fov: Math.max(60, Math.min(600, xf3d.current.fov * factor)) }
+      } else {
+        const rect = canvas.getBoundingClientRect()
+        const mx = e.clientX - rect.left
+        const my = e.clientY - rect.top
+        const { tx, ty, sc, w, h } = xf2d.current
+        const newSc = Math.max(0.4, Math.min(120, sc * factor))
+        const ratio = newSc / sc
+        // Correct pivot formula: world point under cursor stays fixed
+        xf2d.current = {
+          ...xf2d.current,
+          sc: newSc,
+          tx: (mx - w / 2) * (1 - ratio) + tx * ratio,
+          ty: (my - h / 2) * (1 - ratio) + ty * ratio,
+        }
+      }
+      dirtyRef.current = true
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+    return () => canvas.removeEventListener('wheel', onWheel)
+  }, [])
+
+  // ── Mouse ────────────────────────────────────────────────────────────────────
+  function onMouseDown(e) {
+    const { rotX, rotY } = xf3d.current
+    dragRef.current = {
+      on: true, sx: e.clientX, sy: e.clientY,
+      stx: xf2d.current.tx, sty: xf2d.current.ty,
+      srot: [rotX, rotY], moved: false,
+    }
+    e.currentTarget.style.cursor = 'grabbing'
   }
 
-  // Single authoritative click handler — manages toggle via store
-  function handleClick(cluster) {
-    if (!cluster) return
-    const id = cluster.id ?? null
-    setSelectedClusterId(prev => prev === id ? null : id)
+  function onMouseMove(e) {
+    if (dragRef.current.on) {
+      const dx = e.clientX - dragRef.current.sx
+      const dy = e.clientY - dragRef.current.sy
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragRef.current.moved = true
+      if (is3dRef.current) {
+        const [srX, srY] = dragRef.current.srot
+        xf3d.current = {
+          ...xf3d.current,
+          rotY: srY + dx * 0.006,
+          rotX: Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, srX + dy * 0.006)),
+        }
+      } else {
+        xf2d.current = { ...xf2d.current, tx: dragRef.current.stx + dx, ty: dragRef.current.sty + dy }
+      }
+      dirtyRef.current = true
+      return
+    }
+    // Hover (2D only — 3D hover uses projected positions which requires a full pass)
+    if (is3dRef.current) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const { tx, ty, sc, w, h } = xf2d.current
+    const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
+    const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
+    setHoveredClusterId(hit ? hit.id : null)
+  }
+
+  function onMouseUp(e) {
+    const wasDrag = dragRef.current.moved
+    dragRef.current = { ...dragRef.current, on: false, moved: false }
+    e.currentTarget.style.cursor = is3dRef.current ? 'grab' : 'crosshair'
+    if (!wasDrag) {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      if (!is3dRef.current) {
+        const rect = canvas.getBoundingClientRect()
+        const { tx, ty, sc, w, h } = xf2d.current
+        const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
+        const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
+        if (hit) setSelectedClusterId(prev => String(prev) === String(hit.id) ? null : hit.id)
+        else      setSelectedClusterId(null)
+      }
+    }
+  }
+
+  function onMouseLeave(e) {
+    dragRef.current = { ...dragRef.current, on: false }
+    e.currentTarget.style.cursor = is3dRef.current ? 'grab' : 'crosshair'
+    setHoveredClusterId(null)
   }
 
   return (
-    <Canvas
-      camera={{ position: [0, 55, 130], fov: 62, near: 0.5, far: 800 }}
-      gl={{
-        antialias: true,
-        alpha: false,
-        powerPreference: 'high-performance',
-        toneMapping: THREE.ACESFilmicToneMapping,
-        toneMappingExposure: 1.15,
+    <canvas
+      ref={canvasRef}
+      style={{
+        display: 'block', width: '100%', height: '100%',
+        cursor: is3d ? 'grab' : 'crosshair', userSelect: 'none',
       }}
-      style={{ background: 'radial-gradient(ellipse at 50% 40%, #030c1a 0%, #02050a 100%)' }}
-    >
-      <Suspense fallback={null}>
-        <SceneContent
-          clusters={positioned}
-          selectedId={selectedClusterId}
-          hoveredId={hoveredClusterId}
-          onHover={handleHover}
-          onClick={handleClick}
-          showLabels={showLabels}
-          renderMode={renderMode}
-        />
-      </Suspense>
-    </Canvas>
+      onMouseDown={onMouseDown}
+      onMouseMove={onMouseMove}
+      onMouseUp={onMouseUp}
+      onMouseLeave={onMouseLeave}
+    />
   )
 }

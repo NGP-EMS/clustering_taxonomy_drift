@@ -1,352 +1,247 @@
-import { useRef, useMemo, useEffect } from 'react'
-import { useFrame } from '@react-three/fiber'
+import { useRef, useMemo, useEffect, useState } from 'react'
+import { useFrame, useThree } from '@react-three/fiber'
 import { Html } from '@react-three/drei'
 import * as THREE from 'three'
 
-// ─ Pulsing anomaly torus ───────────────────────────────────────────────────────
-function AnomalyRing({ position, color, size }) {
-  const ref = useRef()
-  useFrame(({ clock }) => {
-    if (!ref.current) return
-    const t = clock.getElapsedTime()
-    ref.current.scale.setScalar(1 + Math.sin(t * 2.0) * 0.3)
-    ref.current.material.opacity = 0.28 - Math.sin(t * 2.0) * 0.15
-  })
-  return (
-    <mesh ref={ref} position={position}>
-      <torusGeometry args={[size * 4.2, 0.07, 8, 32]} />
-      <meshBasicMaterial color={color} transparent opacity={0.25} depthWrite={false} />
-    </mesh>
-  )
-}
+function sameId(a, b) { return String(a) === String(b) }
 
-// ─ Floating cluster label ──────────────────────────────────────────────────────
-function ClusterLabel({ cluster }) {
-  const name = cluster.display_name || (cluster.cluster_id ? String(cluster.cluster_id).slice(-10) : '')
-  if (!name) return null
-  const yOff = cluster._size * 5.5 + 2
-  return (
-    <Html
-      position={[cluster._pos[0], cluster._pos[1] + yOff, cluster._pos[2]]}
-      center
-      style={{ pointerEvents: 'none' }}
-    >
-      <div style={{
-        color: cluster._color,
-        fontSize: '9px',
-        fontFamily: '"Cascadia Code","Fira Code",monospace',
-        fontWeight: 700,
-        letterSpacing: '0.06em',
-        textShadow: `0 0 8px ${cluster._color}, 0 0 20px ${cluster._color}55`,
-        userSelect: 'none',
-        whiteSpace: 'nowrap',
-        padding: '2px 8px',
-        borderRadius: 4,
-        background: 'rgba(2,5,10,0.72)',
-        border: `1px solid ${cluster._color}28`,
-        backdropFilter: 'blur(8px)',
-      }}>
-        {name.length > 28 ? name.slice(0, 28) + '…' : name}
-      </div>
-    </Html>
-  )
-}
-
-// ─ Hover tooltip ──────────────────────────────────────────────────────────────
-function ClusterTooltip({ cluster }) {
-  const yOff = cluster._size * 5.5 + 4
-  return (
-    <Html
-      position={[cluster._pos[0], cluster._pos[1] + yOff, cluster._pos[2]]}
-      style={{ pointerEvents: 'none' }}
-    >
-      <div style={{
-        transform: 'translate(-50%, -6px)',
-        background: 'rgba(3,8,15,0.97)',
-        border: `1px solid ${cluster._color}44`,
-        borderRadius: 9,
-        padding: '10px 14px',
-        minWidth: 190,
-        maxWidth: 250,
-        backdropFilter: 'blur(24px)',
-        boxShadow: `0 10px 40px rgba(0,0,0,0.85), 0 0 28px ${cluster._color}12`,
-        fontFamily: 'Inter, system-ui, sans-serif',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-          <span style={{
-            fontSize: 9, fontWeight: 700, padding: '2px 8px', borderRadius: 8,
-            background: cluster._color + '22', color: cluster._color,
-            border: `1px solid ${cluster._color}40`,
-          }}>
-            {cluster.field_name}
-          </span>
-          {cluster.is_true_anomaly_cluster && (
-            <span style={{
-              fontSize: 9, padding: '2px 7px', borderRadius: 8,
-              background: 'rgba(255,51,68,0.2)', color: '#ff3344', fontWeight: 700,
-            }}>
-              ANOMALY
-            </span>
-          )}
-        </div>
-        <div style={{ fontSize: 12.5, fontWeight: 600, color: '#e2e8f0', marginBottom: 5, lineHeight: 1.35 }}>
-          {cluster.display_name || cluster.cluster_id || 'Unnamed Cluster'}
-        </div>
-        {cluster.medoid_label && (
-          <div style={{ fontSize: 10, color: '#64748b', fontStyle: 'italic', marginBottom: 6, lineHeight: 1.4 }}>
-            "{cluster.medoid_label.length > 55 ? cluster.medoid_label.slice(0, 55) + '…' : cluster.medoid_label}"
-          </div>
-        )}
-        <div style={{ display: 'flex', gap: 14, fontSize: 10.5, color: '#475569' }}>
-          <span><span style={{ color: '#94a3b8' }}>{(cluster.cluster_size || 0).toLocaleString()}</span> items</span>
-          <span><span style={{ color: '#94a3b8' }}>{cluster.label_count || 0}</span> labels</span>
-        </div>
-      </div>
-    </Html>
-  )
-}
-
-// ─ Nearest-neighbor link lines (shown on hover/select) ────────────────────────
+// ── Topology links on hover / select ─────────────────────────────────────────
 function NeighborLinks({ focus, neighbors }) {
-  const matRef = useRef()
-
   const geo = useMemo(() => {
+    if (!focus || !neighbors.length) return null
     const pts = []
-    neighbors.forEach(n => { pts.push(...focus._pos, ...n._pos) })
+    neighbors.forEach(n => {
+      pts.push(focus._pos[0], focus._pos[1], 0.05)
+      pts.push(n._pos[0],     n._pos[1],     0.05)
+    })
     const g = new THREE.BufferGeometry()
     g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3))
     return g
   }, [focus, neighbors])
 
-  useFrame(({ clock }) => {
-    if (matRef.current) {
-      matRef.current.opacity = 0.10 + Math.sin(clock.getElapsedTime() * 2.8) * 0.07
-    }
-  })
-
+  if (!geo) return null
   return (
-    <lineSegments geometry={geo}>
-      <lineBasicMaterial
-        ref={matRef}
-        color={focus._color}
-        transparent
-        opacity={0.12}
-        depthWrite={false}
-        blending={THREE.AdditiveBlending}
-      />
+    <lineSegments geometry={geo} raycast={() => {}}>
+      <lineBasicMaterial color="#4a5568" transparent opacity={0.45} depthWrite={false} />
     </lineSegments>
   )
 }
 
-// ─ Main ClusterCloud ───────────────────────────────────────────────────────────
+// ── Thin ring for selected cluster ────────────────────────────────────────────
+function SelectionRing({ cluster }) {
+  const r = cluster._size * 1.8 + 0.3
+  return (
+    <mesh position={[cluster._pos[0], cluster._pos[1], 0.02]} raycast={() => {}}>
+      <ringGeometry args={[r, r + 0.22, 36]} />
+      <meshBasicMaterial color={cluster._color} transparent opacity={0.60} depthWrite={false} />
+    </mesh>
+  )
+}
+
+// ── Cluster label (zoom-gated) ────────────────────────────────────────────────
+function ClusterLabel({ cluster }) {
+  const name = cluster.display_name || cluster.medoid_label || cluster.representative_label
+  if (!name) return null
+  return (
+    <Html
+      position={[cluster._pos[0], cluster._pos[1] + cluster._size + 1.2, 0.1]}
+      center
+      style={{ pointerEvents: 'none' }}
+    >
+      <div style={{
+        color: '#94a3b8',
+        fontSize: '8px',
+        fontFamily: '"Inter", "SF Pro Text", system-ui, sans-serif',
+        fontWeight: 500,
+        opacity: 0.82,
+        userSelect: 'none',
+        whiteSpace: 'nowrap',
+        padding: '1px 5px',
+        borderRadius: 3,
+        background: 'rgba(9,13,20,0.78)',
+        border: '1px solid rgba(255,255,255,0.05)',
+        maxWidth: 160,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      }}>
+        {name.length > 30 ? name.slice(0, 30) + '…' : name}
+      </div>
+    </Html>
+  )
+}
+
+// ── Tooltip (hover / selected) ────────────────────────────────────────────────
+function ClusterTooltip({ cluster }) {
+  return (
+    <Html
+      position={[cluster._pos[0], cluster._pos[1] + cluster._size + 2.4, 0.2]}
+      center
+      style={{ pointerEvents: 'none', zIndex: 100 }}
+    >
+      <div style={{
+        background: 'rgba(8,12,22,0.96)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        borderLeft: `3px solid ${cluster._fieldColor || cluster._color}`,
+        borderRadius: 7,
+        padding: '9px 13px',
+        minWidth: 162,
+        maxWidth: 248,
+        fontFamily: '"Inter", system-ui, sans-serif',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+          <span style={{
+            fontSize: 8.5, fontWeight: 700,
+            color: cluster._fieldColor || cluster._color,
+            letterSpacing: '0.06em', textTransform: 'uppercase',
+          }}>
+            {cluster.field_name}
+          </span>
+          {cluster.is_true_anomaly_cluster && (
+            <span style={{
+              fontSize: 7.5, fontWeight: 700, color: '#f87171',
+              padding: '1px 5px', borderRadius: 4,
+              background: 'rgba(248,113,113,0.12)',
+              border: '1px solid rgba(248,113,113,0.25)',
+            }}>ANOMALY</span>
+          )}
+        </div>
+        <div style={{ fontSize: 11.5, fontWeight: 600, color: '#e2e8f0', marginBottom: 5, lineHeight: 1.35 }}>
+          {cluster.display_name || cluster.medoid_label || cluster.cluster_id || 'Unnamed'}
+        </div>
+        <div style={{ display: 'flex', gap: 14, fontSize: 10, color: '#64748b' }}>
+          <span>
+            <span style={{ color: '#94a3b8' }}>{(cluster.cluster_size || 0).toLocaleString()}</span> items
+          </span>
+          {(cluster.total_occurrences || 0) > 0 && (
+            <span>
+              <span style={{ color: '#94a3b8' }}>{cluster.total_occurrences.toLocaleString()}</span> occ
+            </span>
+          )}
+        </div>
+      </div>
+    </Html>
+  )
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 export default function ClusterCloud({
-  clusters,
-  selectedId,
-  hoveredId,
-  onHover,
-  onClick,
-  showLabels,
-  renderMode,
+  clusters, selectedId, hoveredId, onHover, onClick,
+  showLabels, renderMode, showProximity,
 }) {
-  const coreRef = useRef()
-  const haloRef = useRef()
-  const N = clusters.length
+  const meshRef    = useRef()
+  const { camera } = useThree()
+  const N          = clusters.length
 
-  const sphereGeo = useMemo(() => new THREE.SphereGeometry(1, 10, 10), [])
+  const [lodLevel, setLodLevel] = useState('neighborhood')
+  const lodRef = useRef(lodLevel)
 
-  // ── Two-layer nebula particle system ────────────────────────────────────────
-  const { hazeGeo, innerGeo } = useMemo(() => {
-    const hazePos = [], hazeCol = []
-    const innerPos = [], innerCol = []
-    const color = new THREE.Color()
+  // Stable geometry — 12-segment circle of radius 1
+  const diskGeo = useMemo(() => new THREE.CircleGeometry(1, 12), [])
 
-    clusters.forEach(c => {
-      const sizeLog = Math.log(Math.max(c.cluster_size || 1, 1) + 1)
-      const spread  = Math.max(c._size * 7.5, 3.0)
-      color.set(c._color)
+  // Zoom → LOD (orthographic camera uses .zoom)
+  useFrame(() => {
+    const z    = typeof camera.zoom === 'number' ? camera.zoom : 5
+    const next = z < 3.5 ? 'macro' : z < 7.5 ? 'neighborhood' : z < 14 ? 'cluster' : 'deep'
+    if (next !== lodRef.current) { lodRef.current = next; setLodLevel(next) }
+  })
 
-      // Outer haze — wide spread, very translucent
-      const nHaze = Math.min(Math.floor(sizeLog * 20 + 14), 140)
-      for (let i = 0; i < nHaze; i++) {
-        const r     = spread * (0.38 + Math.random() * 0.62)
-        const theta = Math.random() * Math.PI * 2
-        const phi   = Math.acos(2 * Math.random() - 1)
-        hazePos.push(
-          c._pos[0] + r * Math.sin(phi) * Math.cos(theta),
-          c._pos[1] + r * Math.cos(phi) * 0.5,
-          c._pos[2] + r * Math.sin(phi) * Math.sin(theta),
-        )
-        hazeCol.push(color.r, color.g, color.b)
-      }
-
-      // Inner core — tight, dense, bright
-      const nInner = Math.min(Math.floor(sizeLog * 12 + 10), 90)
-      for (let i = 0; i < nInner; i++) {
-        const r     = spread * Math.random() * 0.36
-        const theta = Math.random() * Math.PI * 2
-        const phi   = Math.acos(2 * Math.random() - 1)
-        innerPos.push(
-          c._pos[0] + r * Math.sin(phi) * Math.cos(theta),
-          c._pos[1] + r * Math.cos(phi) * 0.48,
-          c._pos[2] + r * Math.sin(phi) * Math.sin(theta),
-        )
-        innerCol.push(color.r, color.g, color.b)
-      }
-    })
-
-    function buildGeo(pos, col) {
-      const g = new THREE.BufferGeometry()
-      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3))
-      g.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(col), 3))
-      return g
-    }
-
-    return { hazeGeo: buildGeo(hazePos, hazeCol), innerGeo: buildGeo(innerPos, innerCol) }
-  }, [clusters])
-
-  // ── Centroid instanced mesh updates ─────────────────────────────────────────
+  // Update all instance matrices + colors whenever data or selection changes
   useEffect(() => {
-    if (!coreRef.current || !haloRef.current) return
-    const mat = new THREE.Matrix4()
+    if (!meshRef.current || N === 0) return
+
+    // Allocate scratch objects per-effect-call (not module-level, avoids stale state)
+    const mat   = new THREE.Matrix4()
+    const pos   = new THREE.Vector3()
+    const rot   = new THREE.Quaternion()   // identity (0,0,0,1)
+    const scl   = new THREE.Vector3()
     const color = new THREE.Color()
 
     for (let i = 0; i < N; i++) {
-      const cl  = clusters[i]
-      const sel = selectedId === cl.id
-      const hov = hoveredId  === cl.id
-      const s   = cl._size * 1.35 * (sel ? 2.8 : hov ? 2.1 : 1)
-      const gs  = s * 3.8
+      const c    = clusters[i]
+      const isSel = sameId(selectedId, c.id)
+      const isHov = sameId(hoveredId,  c.id)
+      const s    = (c._size || 0.5) * (isSel ? 1.7 : isHov ? 1.4 : 1.0)
 
-      mat.compose(new THREE.Vector3(...cl._pos), new THREE.Quaternion(), new THREE.Vector3(s, s, s))
-      coreRef.current.setMatrixAt(i, mat)
-      mat.compose(new THREE.Vector3(...cl._pos), new THREE.Quaternion(), new THREE.Vector3(gs, gs, gs))
-      haloRef.current.setMatrixAt(i, mat)
+      // Force z=0 — all circles lie in the 2D map plane
+      pos.set(c._pos[0], c._pos[1], 0)
+      scl.setScalar(s)
+      mat.compose(pos, rot, scl)
+      meshRef.current.setMatrixAt(i, mat)
 
-      color.set(sel || hov ? '#ffffff' : cl._color)
-      coreRef.current.setColorAt(i, color)
-      color.set(cl._color)
-      haloRef.current.setColorAt(i, color)
+      color.set(isSel ? '#f8fafc' : isHov ? '#cbd5e1' : (c._color || '#6366f1'))
+      meshRef.current.setColorAt(i, color)
     }
 
-    coreRef.current.instanceMatrix.needsUpdate = true
-    if (coreRef.current.instanceColor) coreRef.current.instanceColor.needsUpdate = true
-    haloRef.current.instanceMatrix.needsUpdate  = true
-    if (haloRef.current.instanceColor) haloRef.current.instanceColor.needsUpdate = true
+    meshRef.current.instanceMatrix.needsUpdate = true
+    if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true
   }, [clusters, selectedId, hoveredId, N])
 
-  // Breathing glow — halo opacity pulses slowly over time
-  useFrame(({ clock }) => {
-    if (haloRef.current?.material) {
-      const t = clock.getElapsedTime()
-      haloRef.current.material.opacity = 0.032 + Math.sin(t * 0.7) * 0.016
-    }
-  })
-
-  // ── Nearest-neighbor computation (hover + selected) ──────────────────────────
+  // Focus cluster + nearest 6 neighbors for topology links
   const { focusCluster, nearestNeighbors } = useMemo(() => {
-    const focusId = hoveredId ?? selectedId
+    const focusId = selectedId ?? hoveredId
     if (focusId == null || !clusters.length) return { focusCluster: null, nearestNeighbors: [] }
-    const focus = clusters.find(c => c.id === focusId)
+    const focus = clusters.find(c => sameId(c.id, focusId))
     if (!focus) return { focusCluster: null, nearestNeighbors: [] }
-
-    const [fx, fy, fz] = focus._pos
+    const [fx, fy] = focus._pos
     const nearest = clusters
-      .filter(c => c.id !== focusId)
-      .map(c => {
-        const dx = c._pos[0] - fx, dy = c._pos[1] - fy, dz = c._pos[2] - fz
-        return { c, d2: dx * dx + dy * dy + dz * dz }
-      })
+      .filter(c => !sameId(c.id, focusId))
+      .map(c => { const dx = c._pos[0]-fx, dy = c._pos[1]-fy; return { c, d2: dx*dx+dy*dy } })
       .sort((a, b) => a.d2 - b.d2)
       .slice(0, 6)
-      .map(({ c }) => c)
-
+      .map(r => r.c)
     return { focusCluster: focus, nearestNeighbors: nearest }
-  }, [hoveredId, selectedId, clusters])
+  }, [selectedId, hoveredId, clusters])
 
-  const hoveredCluster = hoveredId != null ? clusters.find(c => c.id === hoveredId) : null
+  // Labels: always show selected/hovered; zoom-gate the rest
+  const labelClusters = useMemo(() => {
+    const always = clusters.filter(c => sameId(c.id, selectedId) || sameId(c.id, hoveredId))
+    if (!showLabels && renderMode !== 'labels') return always
 
-  const labelClusters = (showLabels || renderMode === 'labels')
-    ? clusters.filter(c => c._size > 0.22 || (c.cluster_size || 0) > 4).slice(0, 60)
-    : []
+    const thresh = lodLevel === 'macro' ? 0.82 : lodLevel === 'neighborhood' ? 0.64
+      : lodLevel === 'cluster' ? 0.38 : 0.12
+    const cap = lodLevel === 'macro' ? 8 : lodLevel === 'neighborhood' ? 22
+      : lodLevel === 'cluster' ? 60 : 140
 
-  const isDensity   = renderMode === 'density'
-  const hazeOpacity = isDensity ? 0.16 : 0.09
-  const innerOp     = isDensity ? 0.55 : 0.35
-  const hazeSize    = isDensity ? 0.28 : 0.18
-  const innerSize   = isDensity ? 0.14 : 0.088
+    const extra = clusters
+      .filter(c => c._sizeRatio > thresh && !sameId(c.id, selectedId) && !sameId(c.id, hoveredId))
+      .slice(0, cap)
+
+    return [...always, ...extra]
+  }, [clusters, selectedId, hoveredId, showLabels, renderMode, lodLevel])
+
+  const hoveredCluster  = hoveredId  != null ? clusters.find(c => sameId(c.id, hoveredId))  : null
+  const selectedCluster = selectedId != null ? clusters.find(c => sameId(c.id, selectedId)) : null
+
+  if (N === 0) return null
 
   return (
     <group>
-      {/* ─ Outer nebula haze — NON-INTERACTIVE (raycast disabled) ─ */}
-      <points geometry={hazeGeo} raycast={() => {}}>
-        <pointsMaterial
-          vertexColors size={hazeSize} transparent opacity={hazeOpacity}
-          sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending}
-        />
-      </points>
-
-      {/* ─ Inner dense core particles — NON-INTERACTIVE ─ */}
-      <points geometry={innerGeo} raycast={() => {}}>
-        <pointsMaterial
-          vertexColors size={innerSize} transparent opacity={innerOp}
-          sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending}
-        />
-      </points>
-
-      {/* ─ Halo glow spheres — NON-INTERACTIVE (breathing via useFrame) ─ */}
-      <instancedMesh ref={haloRef} args={[sphereGeo, null, N]} raycast={() => {}}>
-        <meshBasicMaterial
-          transparent opacity={0.038} depthWrite={false}
-          blending={THREE.AdditiveBlending} vertexColors
-        />
-      </instancedMesh>
-
-      {/* ─ Centroid core spheres — ONLY interactive geometry ─ */}
+      {/* ── Cluster circles — old proven args pattern: [geo, null, N] + child material */}
       <instancedMesh
-        ref={coreRef}
-        args={[sphereGeo, null, N]}
-        onClick={e => {
-          e.stopPropagation()
-          const i = e.instanceId
-          if (i != null) onClick(clusters[i])
-        }}
-        onPointerMove={e => {
-          e.stopPropagation()
-          const i = e.instanceId
-          if (i != null) onHover(clusters[i])
-        }}
+        ref={meshRef}
+        args={[diskGeo, null, N]}
+        frustumCulled={false}
+        onClick={e => { e.stopPropagation(); if (e.instanceId != null) onClick(clusters[e.instanceId]) }}
+        onPointerMove={e => { e.stopPropagation(); if (e.instanceId != null) onHover(clusters[e.instanceId]) }}
         onPointerLeave={() => onHover(null)}
       >
-        <meshStandardMaterial
-          vertexColors
-          roughness={0.06}
-          metalness={0.65}
-          emissive="#ffffff"
-          emissiveIntensity={0.05}
-        />
+        <meshBasicMaterial vertexColors transparent opacity={0.92} depthWrite={false} />
       </instancedMesh>
 
-      {/* ─ Semantic neighbor links (hover / select) ─ */}
-      {focusCluster && nearestNeighbors.length > 0 && (
+      {/* ── Thin selection ring ───────────────────────────────────────────── */}
+      {selectedCluster && <SelectionRing cluster={selectedCluster} />}
+
+      {/* ── Topology links ────────────────────────────────────────────────── */}
+      {focusCluster && (showProximity || hoveredId != null || selectedId != null) && (
         <NeighborLinks focus={focusCluster} neighbors={nearestNeighbors} />
       )}
 
-      {/* ─ Anomaly pulse rings ─ */}
-      {clusters
-        .filter(c => c.is_true_anomaly_cluster)
-        .slice(0, 50)
-        .map((c, i) => (
-          <AnomalyRing key={c.id ?? i} position={c._pos} color={c._color} size={c._size} />
-        ))
-      }
+      {/* ── Tooltips ──────────────────────────────────────────────────────── */}
+      {hoveredCluster && !sameId(hoveredCluster.id, selectedId) && <ClusterTooltip cluster={hoveredCluster} />}
+      {selectedCluster && !hoveredCluster && <ClusterTooltip cluster={selectedCluster} />}
 
-      {/* ─ Floating labels ─ */}
-      {labelClusters.map(c => (
-        <ClusterLabel key={c.id} cluster={c} />
-      ))}
-
-      {/* ─ Hover tooltip ─ */}
-      {hoveredCluster && <ClusterTooltip cluster={hoveredCluster} />}
+      {/* ── Zoom-gated labels ─────────────────────────────────────────────── */}
+      {labelClusters.map(c => <ClusterLabel key={`lbl-${c.id}`} cluster={c} />)}
     </group>
   )
 }

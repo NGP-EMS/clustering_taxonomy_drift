@@ -7,7 +7,11 @@ const useStore = create((set, get) => ({
 
   // Cluster selection
   selectedClusterId: null,
-  setSelectedClusterId: (id) => set({ selectedClusterId: id }),
+  setSelectedClusterId: (idOrUpdater) => set((s) => ({
+    selectedClusterId: typeof idOrUpdater === 'function'
+      ? idOrUpdater(s.selectedClusterId)
+      : idOrUpdater,
+  })),
   hoveredClusterId: null,
   setHoveredClusterId: (id) => set({ hoveredClusterId: id }),
 
@@ -30,8 +34,16 @@ const useStore = create((set, get) => ({
   setShowLabels: (v) => set({ showLabels: v }),
   anomalyFilter: 'all',
   setAnomalyFilter: (f) => set({ anomalyFilter: f }),
+  activeFields: [],
+  setActiveFields: (fields) => set({ activeFields: Array.isArray(fields) ? fields : [] }),
   activeField: null,
-  setActiveField: (f) => set({ activeField: f }),
+  setActiveField: (f) => set({ activeField: f, activeFields: f ? [f] : [] }),
+  colorMode: 'field',
+  setColorMode: (mode) => set({ colorMode: mode }),
+  showKnn: false,
+  setShowKnn: (v) => set({ showKnn: v }),
+  showAxes: true,
+  setShowAxes: (v) => set({ showAxes: v }),
   cameraReset: 0,
   triggerCameraReset: () => set((s) => ({ cameraReset: s.cameraReset + 1 })),
 

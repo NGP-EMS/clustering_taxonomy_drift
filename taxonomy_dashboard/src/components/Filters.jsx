@@ -49,6 +49,16 @@ export default function Filters({ filters, fields, onChange, onRefresh, anomalyM
           </>
         )}
 
+        <input
+          className="filter-input filter-select--xs"
+          type="number"
+          min="1"
+          placeholder="Min size"
+          value={filters.min_size || 1}
+          onChange={e => onChange({ min_size: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+          title="Minimum cluster size"
+        />
+
         <select
           className="filter-select filter-select--xs"
           value={filters.limit}

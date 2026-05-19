@@ -77,7 +77,7 @@ function VirtualBody({ rows, onRowClick, selectedId }) {
                 className={[
                   'vtable-row',
                   row.is_true_anomaly_cluster && 'row-anomaly',
-                  selectedId === row.id        && 'row-selected',
+                  String(selectedId) === String(row.id) && 'row-selected',
                 ].filter(Boolean).join(' ')}
                 onClick={() => onRowClick(row)}
               >
@@ -136,7 +136,7 @@ export default function ClusterTable({ clusters, loading, error }) {
   }, [])
 
   const handleRowClick = useCallback((row) => {
-    setSelectedClusterId(prev => prev === row.id ? null : row.id)
+    setSelectedClusterId(prev => String(prev) === String(row.id) ? null : row.id)
   }, [setSelectedClusterId])
 
   if (error)   return <div className="state-error">⚠ {error}</div>

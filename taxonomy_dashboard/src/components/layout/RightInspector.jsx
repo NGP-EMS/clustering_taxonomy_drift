@@ -32,6 +32,19 @@ function StatRow({ label, value, mono, accent }) {
   )
 }
 
+function normalizeList(value) {
+  if (!value) return []
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      if (Array.isArray(parsed)) return parsed.filter(Boolean)
+    } catch {}
+    return value.split(/[,\n]/).map(v => v.trim()).filter(Boolean)
+  }
+  return []
+}
+
 function QualityItem({ type, text }) {
   const styles = {
     ok:       { color: '#10b981', bg: 'rgba(16,185,129,0.07)',  border: 'rgba(16,185,129,0.2)'  },
@@ -64,6 +77,7 @@ function LabelBarRow({ label, count, max, color }) {
 
 function SimilarBtn({ cluster, onClick }) {
   const fc = getFieldColor(cluster.field_name)
+  const sim = cluster.cosine_similarity != null ? Number(cluster.cosine_similarity) : null
   return (
     <button
       onClick={() => onClick(cluster.id)}
@@ -74,7 +88,8 @@ function SimilarBtn({ cluster, onClick }) {
     >
       <span className="text-[10px] font-bold" style={{ color: fc }}>{cluster.field_name}</span>
       <span className="text-[11px] text-star truncate max-w-[130px]">{cluster.display_name || <em className="text-dust">unnamed</em>}</span>
-      <span className="text-[9px] text-dust">{(cluster.cluster_size || 0).toLocaleString()} items</span>
+      <span className="text-[9px] text-dust">{sim != null ? `${(sim * 100).toFixed(1)}% cosine` : `${(cluster.cluster_size || 0).toLocaleString()} items`}</span>
+      {cluster.interpretation && <span className="text-[8.5px]" style={{ color: cluster.same_field ? '#10b981' : '#f59e0b' }}>{cluster.interpretation}</span>}
     </button>
   )
 }
@@ -84,26 +99,42 @@ export default function RightInspector({ clusterId }) {
   const [cluster, setCluster] = useState(null)
   const [labels,  setLabels]  = useState([])
   const [similar, setSimilar] = useState([])
+  const [similarMeta, setSimilarMeta] = useState(null)
   const [loading, setLoading] = useState(false)
   const [copiedId, copyId]    = useCopy(cluster?.cluster_id)
 
   useEffect(() => {
     if (!clusterId) return
-    setCluster(null); setLabels([]); setSimilar([])
+    let cancelled = false
+    setCluster(null); setLabels([]); setSimilar([]); setSimilarMeta(null)
     setLoading(true)
     Promise.allSettled([
       fetch(`/api/cluster/${clusterId}`).then(r => r.json()),
       fetch(`/api/cluster/${clusterId}/labels?limit=30`).then(r => r.json()),
       fetch(`/api/cluster/${clusterId}/similar?limit=6`).then(r => r.json()),
     ]).then(([c, l, s]) => {
-      if (c.status === 'fulfilled') setCluster(c.value)
+      if (cancelled) return
+      if (c.status === 'fulfilled' && c.value && !c.value.error) setCluster(c.value)
       if (l.status === 'fulfilled' && Array.isArray(l.value)) setLabels(l.value)
-      if (s.status === 'fulfilled' && Array.isArray(s.value)) setSimilar(s.value)
-    }).finally(() => setLoading(false))
+      if (s.status === 'fulfilled') {
+        if (Array.isArray(s.value)) setSimilar(s.value)
+        else {
+          setSimilarMeta(s.value)
+          setSimilar(Array.isArray(s.value?.neighbors) ? s.value.neighbors : [])
+        }
+      }
+    }).finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
   }, [clusterId])
 
   const fc       = cluster ? getFieldColor(cluster.field_name) : '#00d4ff'
   const maxCount = labels.length ? Math.max(...labels.map(l => Number(l.value_count) || 1)) : 1
+  const representativeLabels = normalizeList(cluster?.representative_labels || cluster?.representative_label)
+  const medoidSimilarity = cluster?.medoid_similarity_to_centroid != null ? Number(cluster.medoid_similarity_to_centroid) : null
+  const cohesionLabel = medoidSimilarity == null ? 'not computed'
+    : medoidSimilarity >= 0.86 ? 'strong cohesion'
+      : medoidSimilarity >= 0.72 ? 'moderate cohesion'
+        : 'weak cohesion'
 
   const quality = cluster ? (() => {
     const issues = [], ok = []
@@ -232,13 +263,32 @@ export default function RightInspector({ clusterId }) {
           <div className="px-4 py-3" style={{ borderBottom: '1px solid rgba(26,45,74,0.5)' }}>
             <div className="text-[9px] uppercase tracking-widest text-dust/60 mb-2">Identity</div>
             <StatRow label="Field"     value={cluster.field_name} accent="cyan" />
+            <StatRow label="Cluster ID" value={cluster.cluster_id} mono />
+            <StatRow label="Anomaly"   value={cluster.is_true_anomaly_cluster ? 'true' : 'false'} accent={cluster.is_true_anomaly_cluster ? 'red' : 'emerald'} />
             <StatRow label="Version"   value={cluster.cluster_version} />
             <StatRow label="Source"    value={cluster.cluster_source} />
             <StatRow label="Method"    value={cluster.naming_method} />
             <StatRow label="Threshold" value={cluster.similarity_threshold != null ? Number(cluster.similarity_threshold).toFixed(3) : null} mono />
             <StatRow label="Centroid"  value={cluster.has_centroid ? '✓ present' : '✗ missing'} accent={cluster.has_centroid ? 'emerald' : 'red'} />
+            <StatRow label="Medoid"    value={cluster.medoid_label ? 'present' : 'missing'} accent={cluster.medoid_label ? 'emerald' : 'red'} />
+            <StatRow label="Medoid-Centroid" value={medoidSimilarity != null ? medoidSimilarity.toFixed(3) : null} mono accent={medoidSimilarity >= 0.72 ? 'emerald' : 'red'} />
+            <StatRow label="Cohesion" value={cohesionLabel} accent={medoidSimilarity == null ? null : medoidSimilarity >= 0.72 ? 'emerald' : 'red'} />
             <StatRow label="Run ID"    value={cluster.run_id ? cluster.run_id.slice(0, 20) : null} mono />
           </div>
+
+          {representativeLabels.length > 0 && (
+            <div className="px-4 py-3" style={{ borderBottom: '1px solid rgba(26,45,74,0.5)' }}>
+              <div className="text-[9px] uppercase tracking-widest text-dust/60 mb-2">Representative Labels</div>
+              <div className="flex flex-col gap-1.5">
+                {representativeLabels.slice(0, 12).map((label, i) => (
+                  <div key={i} className="font-mono text-[10.5px] text-nebula rounded-md px-2.5 py-1.5"
+                    style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(26,45,74,0.55)', wordBreak: 'break-word' }}>
+                    {label}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Label distribution */}
           <div className="px-4 py-3" style={{ borderBottom: '1px solid rgba(26,45,74,0.5)' }}>
@@ -262,9 +312,17 @@ export default function RightInspector({ clusterId }) {
           {/* Similar clusters */}
           <div className="px-4 py-3">
             <div className="text-[9px] uppercase tracking-widest text-dust/60 mb-2 flex items-center gap-2">
-              <Sparkles size={9} /> Similar in Field
+              <Sparkles size={9} /> Semantic Proximity Graph
             </div>
-            {similar.length === 0 && <p className="text-[11px] text-dust">No similar clusters found.</p>}
+            <p className="text-[10.5px] text-dust mb-2 leading-snug">
+              {similarMeta?.status === 'computed'
+                ? 'Centroid cosine nearest-neighbor hints. These are analytical proximity links, not official taxonomy relationships.'
+                : similarMeta?.reason || 'Embedding proximity not computed.'}
+            </p>
+            {similarMeta?.avg_neighbor_similarity != null && (
+              <StatRow label="Avg Neighbor Sim" value={Number(similarMeta.avg_neighbor_similarity).toFixed(3)} mono accent="cyan" />
+            )}
+            {similar.length === 0 && <p className="text-[11px] text-dust">No proximity neighbors found.</p>}
             <div className="grid grid-cols-2 gap-2">
               {similar.map(s => (
                 <SimilarBtn key={s.id} cluster={s} onClick={id => setSelectedClusterId(id)} />
