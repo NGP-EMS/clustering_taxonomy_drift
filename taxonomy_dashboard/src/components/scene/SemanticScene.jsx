@@ -75,7 +75,8 @@ function selectedMedoidOffset(cluster, scale = 1) {
 function drawTooltip(ctx, c, px, py, w, h) {
   const title = c.display_name || c.medoid_label || c.cluster_id || 'Unnamed'
   const titleT = title.length > 36 ? title.slice(0, 36) + '…' : title
-  const sub = `${(c.cluster_size || 0).toLocaleString()} items · ${c.field_name || ''}`
+  const prod = c.production_hit_count ? ` · ${Number(c.production_hit_count).toLocaleString()} production hits` : ''
+  const sub = `${(c.cluster_size || 0).toLocaleString()} items · ${c.field_name || ''}${prod}`
   ctx.save()
   ctx.font = '600 11px Inter,system-ui,sans-serif'
   const tw = Math.max(ctx.measureText(titleT).width, ctx.measureText(sub).width)
@@ -172,6 +173,16 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     ctx.fillStyle = c._color || '#6366f1'
     ctx.globalAlpha = cls.length > 2500 ? 0.58 : cls.length > 1200 ? 0.68 : 0.82
     ctx.fill()
+    if (c.production_hit_count) {
+      ctx.globalAlpha = 0.9
+      ctx.beginPath()
+      ctx.arc(px, py, r + 3, 0, Math.PI * 2)
+      ctx.strokeStyle = '#10b981'
+      ctx.lineWidth = 1.4
+      ctx.setLineDash([3, 3])
+      ctx.stroke()
+      ctx.setLineDash([])
+    }
   }
   ctx.globalAlpha = 1
 
@@ -209,6 +220,14 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     }
     ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+
+    if (focusC.production_hit_count) {
+      ctx.beginPath(); ctx.arc(px, py, r + 8, 0, Math.PI * 2)
+      ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([])
+      ctx.font = '700 9px Inter,system-ui,sans-serif'
+      ctx.fillStyle = '#10b981'
+      ctx.fillText(`${Number(focusC.production_hit_count).toLocaleString()} prod`, px + r + 8, py - r - 3)
+    }
 
     if (isSel) {
       const { dx, dy, sim } = selectedMedoidOffset(focusC, 1)
@@ -339,6 +358,11 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
     }
     ctx.beginPath(); ctx.arc(px, py, Math.max(r, 0.5), 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'; ctx.globalAlpha = alpha * 0.9; ctx.fill()
+    if (c.production_hit_count) {
+      ctx.globalAlpha = Math.min(1, alpha + 0.15)
+      ctx.beginPath(); ctx.arc(px, py, Math.max(r + 3, 4), 0, Math.PI * 2)
+      ctx.strokeStyle = '#10b981'; ctx.lineWidth = 1.3; ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([])
+    }
   }
   ctx.globalAlpha = 1
 
@@ -390,6 +414,14 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
     }
     ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = isSel ? '#f8fafc' : '#cbd5e1'; ctx.fill()
+
+    if (c.production_hit_count) {
+      ctx.beginPath(); ctx.arc(px, py, r + 8, 0, Math.PI * 2)
+      ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([])
+      ctx.font = '700 9px Inter,system-ui,sans-serif'
+      ctx.fillStyle = '#10b981'
+      ctx.fillText(`${Number(c.production_hit_count).toLocaleString()} prod`, px + r + 8, py - r - 3)
+    }
 
     if (isSel) {
       const { dx, dy, sim } = selectedMedoidOffset(c, 0.82)

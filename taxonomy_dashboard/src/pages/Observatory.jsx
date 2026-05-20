@@ -1,5 +1,5 @@
-import { useEffect, useState, lazy, Suspense } from 'react'
-import { RotateCcw, Map, Orbit, Search, SlidersHorizontal, Minus, Plus, Maximize2, Table2, Columns, LayoutDashboard } from 'lucide-react'
+import { useEffect, useMemo, useState, lazy, Suspense } from 'react'
+import { RotateCcw, Map as MapIcon, Orbit, Search, SlidersHorizontal, Minus, Plus, Maximize2, Table2, Columns, LayoutDashboard } from 'lucide-react'
 import useStore from '../store/useStore.js'
 import RightInspector from '../components/layout/RightInspector.jsx'
 import ClusterTable from '../components/ClusterTable.jsx'
@@ -205,6 +205,8 @@ export default function Observatory() {
   const [viewMode,       setViewMode]       = useState('map')
   const [showLabels,     setShowLabels]     = useState(false)
   const [sizeFilter,     setSizeFilter]     = useState(1)
+  const [showProduction, setShowProduction] = useState(false)
+  const [productionOverlay, setProductionOverlay] = useState({ available: false, rows: [], latest_run_id: null })
 
   const sendSceneCommand = (action) => {
     window.dispatchEvent(new CustomEvent('semantic-scene-command', { detail: { action } }))
@@ -225,11 +227,13 @@ export default function Observatory() {
       fetch('/api/semantic-compression').then(r => r.json()),
       fetch('/api/drift-summary').then(r => r.json()),
       fetch('/api/medoid-intelligence').then(r => r.json()),
-    ]).then(([fieldsRes, an, comp, dr, med]) => {
+      fetch('/api/production-mapper/semantic-overlay').then(r => r.json()),
+    ]).then(([fieldsRes, an, comp, dr, med, prod]) => {
       if (an.status === 'fulfilled')   setAnomalySummary(an.value?.summary)
       if (comp.status === 'fulfilled') setCompression(comp.value)
       if (dr.status === 'fulfilled')   setDrift(dr.value)
       if (med.status === 'fulfilled')  setMedoid(med.value)
+      if (prod.status === 'fulfilled') setProductionOverlay(prod.value)
 
       const fieldList = (fieldsRes.status === 'fulfilled' && Array.isArray(fieldsRes.value))
         ? fieldsRes.value : []
@@ -261,7 +265,32 @@ export default function Observatory() {
     }).finally(() => setLoading(false))
   }, [])
 
-  const displayClusters = clusters.filter(c => {
+
+  const productionOverlayMap = useMemo(() => {
+    const map = new Map()
+    for (const row of productionOverlay?.rows || []) {
+      if (!row?.field_name || !row?.mapped_cluster_id) continue
+      map.set(`${row.field_name}:${row.mapped_cluster_id}`, row)
+    }
+    return map
+  }, [productionOverlay])
+
+  const clustersWithProduction = useMemo(() => {
+    if (!showProduction || !productionOverlayMap.size) return clusters
+    return clusters.map(c => {
+      const hit = productionOverlayMap.get(`${c.field_name}:${c.cluster_id}`)
+      if (!hit) return c
+      return {
+        ...c,
+        production_hit_count: hit.production_hit_count,
+        production_distinct_calls: hit.production_distinct_calls,
+        production_latest_classified_at: hit.latest_classified_at,
+        production_raw_labels: hit.raw_labels || [],
+      }
+    })
+  }, [clusters, showProduction, productionOverlayMap])
+
+  const displayClusters = clustersWithProduction.filter(c => {
     if (selectedFields.length && !selectedFields.includes(c.field_name)) return false
     if (anomalyFilter === 'anomaly'  && !c.is_true_anomaly_cluster) return false
     if (anomalyFilter === 'standard' &&  c.is_true_anomaly_cluster) return false
@@ -269,13 +298,13 @@ export default function Observatory() {
     return true
   })
 
-  const fieldGroups = clusters.reduce((acc, c) => {
+  const fieldGroups = clustersWithProduction.reduce((acc, c) => {
     acc[c.field_name] = (acc[c.field_name] || 0) + 1; return acc
   }, {})
   const fields = Object.entries(fieldGroups).sort((a, b) => b[1] - a[1])
 
   const anomalyCount  = health?.anomaly_clusters || anomalySummary?.total || 0
-  const totalClusters = health?.total_clusters || clusters.length || 0
+  const totalClusters = health?.total_clusters || clustersWithProduction.length || 0
   const namedCount    = health?.named_clusters || 0
   const coveragePct   = totalClusters ? namedCount / totalClusters : 0
   const rawLabels     = compression?.raw_label_count || health?.total_label_rows || 0
@@ -327,7 +356,7 @@ export default function Observatory() {
           {/* View */}
           <CtrlSection label="View">
             <div className="grid grid-cols-2 gap-1 rounded-lg p-1" style={{ border: '1px solid rgba(26,45,74,0.65)', background: 'rgba(3,8,15,0.65)' }}>
-              {[['map', Map, 'Map'], ['3d', Orbit, '3D'], ['table', Table2, 'Table'], ['split', Columns, 'Split']].map(([mode, Icon, lbl]) => (
+              {[['map', MapIcon, 'Map'], ['3d', Orbit, '3D'], ['table', Table2, 'Table'], ['split', Columns, 'Split']].map(([mode, Icon, lbl]) => (
                 <button key={mode} onClick={() => setViewMode(mode)}
                   className="flex items-center justify-center gap-1.5 rounded-md py-1.5 px-2 text-[9.5px] font-semibold transition-all duration-150 whitespace-nowrap"
                   style={viewMode === mode
@@ -399,6 +428,24 @@ export default function Observatory() {
             </div>
           </CtrlSection>
 
+          {/* Production overlay */}
+          <CtrlSection label="Production">
+            <div className="flex flex-col gap-1.5">
+              <button onClick={() => setShowProduction(v => !v)}
+                className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg transition-all duration-150"
+                style={{
+                  background: showProduction ? 'rgba(16,185,129,0.09)' : 'rgba(255,255,255,0.025)',
+                  border: `1px solid ${showProduction ? 'rgba(16,185,129,0.38)' : 'rgba(26,45,74,0.5)'}`,
+                }}>
+                <span className="text-[10px]" style={{ color: showProduction ? '#10b981' : '#475569' }}>Latest mapped labels</span>
+                <span className="text-[9px] font-mono" style={{ color: showProduction ? '#10b981' : '#334155' }}>{(productionOverlay?.rows?.length || 0).toLocaleString()}</span>
+              </button>
+              <div className="text-[8.5px] leading-snug" style={{ color: '#334155' }}>
+                Marks approved clusters touched by the latest production mapper run.
+              </div>
+            </div>
+          </CtrlSection>
+
           {/* Field selector */}
           <CtrlSection label="Field">
             <div className="flex flex-col gap-0.5">
@@ -411,7 +458,7 @@ export default function Observatory() {
                 <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
                   style={{ background: !selectedFields.length ? '#00d4ff' : '#1e3450', boxShadow: !selectedFields.length ? '0 0 5px #00d4ff' : 'none' }} />
                 <span className="flex-1 text-[10px]" style={{ color: !selectedFields.length ? '#00d4ff' : '#475569' }}>All Fields</span>
-                <span className="text-[9px]" style={{ color: !selectedFields.length ? '#00d4ff88' : '#334155' }}>{clusters.length}</span>
+                <span className="text-[9px]" style={{ color: !selectedFields.length ? '#00d4ff88' : '#334155' }}>{clustersWithProduction.length}</span>
               </button>
               {fields.map(([field, count]) => (
                 <FieldChip key={field} field={field} count={count}
@@ -469,6 +516,7 @@ export default function Observatory() {
                 ['Centroid', '#3b82f6', 'ring'],
                 ['Medoid', '#f97316', 'diamond'],
                 ['Anomaly', '#ec4899', 'dot'],
+                ...(showProduction ? [['Production hit', '#10b981', 'ring']] : []),
               ].map(([label, color, kind]) => (
                 <div key={label} className="flex items-center gap-1 text-[10px] text-star">
                   {kind === 'diamond' ? <span className="w-2 h-2 rotate-45" style={{ border: `2px solid ${color}` }} />

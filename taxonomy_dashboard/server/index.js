@@ -1269,6 +1269,294 @@ app.get('/api/run-metadata', async (req, res) => {
   } catch (err) { console.error('/api/run-metadata:', err.message); res.status(500).json({ error: err.message }); }
 });
 
+
+
+// ── Production mapper / Iris feeds ────────────────────────────────────────────
+async function productionMapperAvailable() {
+  return await tableExists('taxonomy_call_cluster_outputs');
+}
+
+function productionLimit(value, fallback = 200, max = 1000) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(parsed, max));
+}
+
+async function latestMapperRunId() {
+  const exists = await productionMapperAvailable();
+  if (!exists) return null;
+  const { rows } = await pool.query(`
+    SELECT mapper_run_id
+    FROM taxonomy_call_cluster_outputs
+    WHERE mapper_run_id IS NOT NULL
+    GROUP BY mapper_run_id
+    ORDER BY MAX(created_at) DESC NULLS LAST
+    LIMIT 1
+  `);
+  return rows[0]?.mapper_run_id || null;
+}
+
+function productionRunPredicate(alias = 'o') {
+  return `($1::text IS NULL OR ${alias}.mapper_run_id = $1)`;
+}
+
+// ── GET /api/production-mapper/summary ───────────────────────────────────────
+app.get('/api/production-mapper/summary', async (req, res) => {
+  try {
+    if (!(await productionMapperAvailable())) {
+      return res.json({ available: false, latest_run_id: null, summary: null, field_health: [], emerging: [], config_issues: [] });
+    }
+
+    const requestedRun = req.query.run_id ? String(req.query.run_id) : null;
+    const runId = requestedRun || await latestMapperRunId();
+    if (!runId) {
+      return res.json({ available: true, latest_run_id: null, summary: null, field_health: [], emerging: [], config_issues: [] });
+    }
+
+    const { rows: [summary] } = await pool.query(`
+      SELECT
+        mapper_run_id,
+        COUNT(*)::int AS total_rows,
+        COUNT(DISTINCT source_record_id)::int AS distinct_calls,
+        COUNT(*) FILTER (WHERE mapping_status = 'EXISTING_CLUSTER')::int AS existing_cluster_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NEW_CLUSTER_CANDIDATE')::int AS new_cluster_candidate_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'TRUE_ANOMALY')::int AS true_anomaly_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NO_CLUSTER_REFERENCE')::int AS no_cluster_reference_rows,
+        COUNT(*) FILTER (WHERE mapping_method = 'exact_label_map')::int AS exact_label_map_rows,
+        COUNT(*) FILTER (WHERE mapping_method = 'centroid_similarity')::int AS centroid_similarity_rows,
+        COUNT(*) FILTER (WHERE mapping_method = 'near_existing_below_threshold')::int AS near_existing_rows,
+        MIN(mapper_window_start) AS mapper_window_start,
+        MAX(mapper_window_end) AS mapper_window_end,
+        MAX(classified_at) AS latest_classified_at,
+        MAX(created_at) AS last_written_at,
+        CASE WHEN COUNT(*) > 0 THEN COUNT(*) FILTER (WHERE mapping_status = 'EXISTING_CLUSTER')::numeric / COUNT(*) ELSE NULL END AS existing_cluster_rate,
+        CASE WHEN COUNT(*) > 0 THEN COUNT(*) FILTER (WHERE mapping_status IN ('NEW_CLUSTER_CANDIDATE','TRUE_ANOMALY'))::numeric / COUNT(*) ELSE NULL END AS emerging_rate
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id = $1
+      GROUP BY mapper_run_id
+    `, [runId]);
+
+    const { rows: fieldHealth } = await pool.query(`
+      SELECT
+        field_name,
+        COUNT(*)::int AS total_rows,
+        COUNT(DISTINCT source_record_id)::int AS distinct_calls,
+        COUNT(*) FILTER (WHERE mapping_status = 'EXISTING_CLUSTER')::int AS existing_cluster_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NEW_CLUSTER_CANDIDATE')::int AS new_cluster_candidate_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'TRUE_ANOMALY')::int AS true_anomaly_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NO_CLUSTER_REFERENCE')::int AS no_cluster_reference_rows,
+        COUNT(*) FILTER (WHERE mapping_method = 'exact_label_map')::int AS exact_label_map_rows,
+        COUNT(*) FILTER (WHERE mapping_method = 'centroid_similarity')::int AS centroid_similarity_rows,
+        ROUND(AVG(similarity_score)::numeric, 4) AS avg_similarity,
+        CASE WHEN COUNT(*) > 0 THEN COUNT(*) FILTER (WHERE mapping_status = 'EXISTING_CLUSTER')::numeric / COUNT(*) ELSE NULL END AS existing_cluster_rate
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id = $1
+      GROUP BY field_name
+      ORDER BY new_cluster_candidate_rows DESC, true_anomaly_rows DESC, no_cluster_reference_rows DESC, total_rows DESC, field_name
+    `, [runId]);
+
+    const { rows: emerging } = await pool.query(`
+      SELECT
+        mapper_run_id,
+        classified_at,
+        source_record_id,
+        field_name,
+        raw_label,
+        normalized_label,
+        mapped_cluster_id,
+        mapped_display_name,
+        similarity_score,
+        mapping_status,
+        mapping_method,
+        top_candidates
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id = $1
+        AND mapping_status IN ('NEW_CLUSTER_CANDIDATE','TRUE_ANOMALY')
+      ORDER BY classified_at DESC NULLS LAST, similarity_score DESC NULLS LAST
+      LIMIT 50
+    `, [runId]);
+
+    const { rows: configIssues } = await pool.query(`
+      SELECT
+        mapper_run_id,
+        classified_at,
+        source_record_id,
+        field_name,
+        raw_label,
+        normalized_label,
+        mapping_status,
+        mapping_method
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id = $1
+        AND mapping_status = 'NO_CLUSTER_REFERENCE'
+      ORDER BY classified_at DESC NULLS LAST
+      LIMIT 50
+    `, [runId]);
+
+    res.json({
+      available: true,
+      latest_run_id: runId,
+      summary: summary || null,
+      field_health: fieldHealth,
+      emerging,
+      config_issues: configIssues,
+    });
+  } catch (err) { console.error('/api/production-mapper/summary:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /api/production-mapper/runs ──────────────────────────────────────────
+app.get('/api/production-mapper/runs', async (req, res) => {
+  try {
+    if (!(await productionMapperAvailable())) return res.json({ available: false, runs: [] });
+    const limit = productionLimit(req.query.limit, 20, 100);
+    const { rows } = await pool.query(`
+      SELECT
+        mapper_run_id,
+        COUNT(*)::int AS total_rows,
+        COUNT(DISTINCT source_record_id)::int AS distinct_calls,
+        COUNT(*) FILTER (WHERE mapping_status = 'EXISTING_CLUSTER')::int AS existing_cluster_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NEW_CLUSTER_CANDIDATE')::int AS new_cluster_candidate_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'TRUE_ANOMALY')::int AS true_anomaly_rows,
+        COUNT(*) FILTER (WHERE mapping_status = 'NO_CLUSTER_REFERENCE')::int AS no_cluster_reference_rows,
+        MIN(mapper_window_start) AS mapper_window_start,
+        MAX(mapper_window_end) AS mapper_window_end,
+        MAX(created_at) AS last_written_at
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id IS NOT NULL
+      GROUP BY mapper_run_id
+      ORDER BY MAX(created_at) DESC NULLS LAST
+      LIMIT $1
+    `, [limit]);
+    res.json({ available: true, runs: rows });
+  } catch (err) { console.error('/api/production-mapper/runs:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /api/production-mapper/canonical ─────────────────────────────────────
+app.get('/api/production-mapper/canonical', async (req, res) => {
+  try {
+    const source = await tableExists('iris_taxonomy_canonical_feed') ? 'iris_taxonomy_canonical_feed' : 'taxonomy_call_cluster_outputs';
+    if (!(await tableExists(source))) return res.json({ available: false, rows: [] });
+    const runId = req.query.run_id ? String(req.query.run_id) : null;
+    const limit = productionLimit(req.query.limit, 300, 2000);
+    const statusFilter = source === 'taxonomy_call_cluster_outputs' ? "o.mapping_status = 'EXISTING_CLUSTER' AND" : '';
+    const { rows } = await pool.query(`
+      SELECT
+        o.mapper_run_id,
+        o.classified_at,
+        o.source_record_id,
+        o.field_name,
+        o.raw_label,
+        o.normalized_label,
+        o.mapped_cluster_id,
+        o.mapped_display_name,
+        o.similarity_score,
+        'EXISTING_CLUSTER'::text AS mapping_status,
+        o.mapping_method
+      FROM ${source} o
+      WHERE ${statusFilter} ${productionRunPredicate('o')}
+      ORDER BY o.classified_at DESC NULLS LAST, o.source_record_id, o.field_name
+      LIMIT $2
+    `, [runId, limit]);
+    res.json({ available: true, source, rows });
+  } catch (err) { console.error('/api/production-mapper/canonical:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /api/production-mapper/emerging ──────────────────────────────────────
+app.get('/api/production-mapper/emerging', async (req, res) => {
+  try {
+    const source = await tableExists('iris_taxonomy_emerging_feed') ? 'iris_taxonomy_emerging_feed' : 'taxonomy_call_cluster_outputs';
+    if (!(await tableExists(source))) return res.json({ available: false, rows: [] });
+    const runId = req.query.run_id ? String(req.query.run_id) : null;
+    const limit = productionLimit(req.query.limit, 200, 1000);
+    const mappedClusterExpr = source === 'taxonomy_call_cluster_outputs' ? 'o.mapped_cluster_id' : 'NULL::text AS mapped_cluster_id';
+    const mappedDisplayExpr = source === 'taxonomy_call_cluster_outputs' ? 'o.mapped_display_name' : 'NULL::text AS mapped_display_name';
+    const methodExpr = source === 'taxonomy_call_cluster_outputs' ? 'o.mapping_method' : 'NULL::text AS mapping_method';
+    const { rows } = await pool.query(`
+      SELECT
+        o.mapper_run_id,
+        o.classified_at,
+        o.source_record_id,
+        o.field_name,
+        o.raw_label,
+        o.normalized_label,
+        ${mappedClusterExpr},
+        ${mappedDisplayExpr},
+        o.similarity_score,
+        o.mapping_status,
+        ${methodExpr},
+        o.top_candidates
+      FROM ${source} o
+      WHERE o.mapping_status IN ('NEW_CLUSTER_CANDIDATE','TRUE_ANOMALY')
+        AND ${productionRunPredicate('o')}
+      ORDER BY o.classified_at DESC NULLS LAST, o.similarity_score DESC NULLS LAST
+      LIMIT $2
+    `, [runId, limit]);
+    res.json({ available: true, source, rows });
+  } catch (err) { console.error('/api/production-mapper/emerging:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /api/production-mapper/config-issues ─────────────────────────────────
+app.get('/api/production-mapper/config-issues', async (req, res) => {
+  try {
+    const source = await tableExists('iris_taxonomy_config_issue_feed') ? 'iris_taxonomy_config_issue_feed' : 'taxonomy_call_cluster_outputs';
+    if (!(await tableExists(source))) return res.json({ available: false, rows: [] });
+    const runId = req.query.run_id ? String(req.query.run_id) : null;
+    const limit = productionLimit(req.query.limit, 200, 1000);
+    const methodExpr = source === 'taxonomy_call_cluster_outputs' ? 'o.mapping_method' : 'NULL::text AS mapping_method';
+    const { rows } = await pool.query(`
+      SELECT
+        o.mapper_run_id,
+        o.classified_at,
+        o.source_record_id,
+        o.field_name,
+        o.raw_label,
+        o.normalized_label,
+        o.mapping_status,
+        ${methodExpr}
+      FROM ${source} o
+      WHERE o.mapping_status = 'NO_CLUSTER_REFERENCE'
+        AND ${productionRunPredicate('o')}
+      ORDER BY o.classified_at DESC NULLS LAST
+      LIMIT $2
+    `, [runId, limit]);
+    res.json({ available: true, source, rows });
+  } catch (err) { console.error('/api/production-mapper/config-issues:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// ── GET /api/production-mapper/semantic-overlay ──────────────────────────────
+app.get('/api/production-mapper/semantic-overlay', async (req, res) => {
+  try {
+    if (!(await productionMapperAvailable())) return res.json({ available: false, latest_run_id: null, rows: [] });
+    const requestedRun = req.query.run_id ? String(req.query.run_id) : null;
+    const runId = requestedRun || await latestMapperRunId();
+    if (!runId) return res.json({ available: true, latest_run_id: null, rows: [] });
+
+    const { rows } = await pool.query(`
+      SELECT
+        field_name,
+        mapped_cluster_id,
+        MAX(mapped_display_name) AS mapped_display_name,
+        COUNT(*)::int AS production_hit_count,
+        COUNT(DISTINCT source_record_id)::int AS production_distinct_calls,
+        MAX(classified_at) AS latest_classified_at,
+        ARRAY_AGG(DISTINCT raw_label) FILTER (WHERE raw_label IS NOT NULL) AS raw_labels
+      FROM taxonomy_call_cluster_outputs
+      WHERE mapper_run_id = $1
+        AND mapping_status = 'EXISTING_CLUSTER'
+        AND mapped_cluster_id IS NOT NULL
+      GROUP BY field_name, mapped_cluster_id
+      ORDER BY production_hit_count DESC, field_name, mapped_cluster_id
+      LIMIT 1000
+    `, [runId]);
+
+    res.json({
+      available: true,
+      latest_run_id: runId,
+      rows: rows.map(r => ({ ...r, raw_labels: Array.isArray(r.raw_labels) ? r.raw_labels.slice(0, 6) : [] })),
+    });
+  } catch (err) { console.error('/api/production-mapper/semantic-overlay:', err.message); res.status(500).json({ error: err.message }); }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.SERVER_PORT || '5050', 10);
 app.listen(PORT, () => console.log(`Taxonomy API → http://localhost:${PORT}`));

@@ -169,6 +169,7 @@ function ActionCard({ title, detail, severity = 'info', metric, onClick }) {
 function SectionNav() {
   const items = [
     ['summary', 'Overview'],
+    ['production', 'Production'],
     ['actions', 'Actions'],
     ['matrix', 'Field Matrix'],
     ['compression', 'Compression'],
@@ -231,6 +232,133 @@ function FieldHealthMatrix({ rows }) {
   )
 }
 
+
+function ProductionMappingPanel({ production, runs }) {
+  const summary = production?.summary || {}
+  const fields = safeArray(production?.field_health)
+  const emerging = safeArray(production?.emerging)
+  const configIssues = safeArray(production?.config_issues)
+  const available = production?.available !== false
+  const latestRun = production?.latest_run_id || summary.mapper_run_id || '—'
+  const totalRows = n(summary.total_rows)
+  const existingRows = n(summary.existing_cluster_rows)
+  const emergingRows = n(summary.new_cluster_candidate_rows) + n(summary.true_anomaly_rows)
+  const configRows = n(summary.no_cluster_reference_rows)
+  const existingRate = summary.existing_cluster_rate != null ? Number(summary.existing_cluster_rate) : rate(existingRows, totalRows)
+
+  if (!available) {
+    return (
+      <div className="rounded-xl p-4" style={{ background: 'rgba(255,255,255,0.022)', border: '1px solid rgba(26,45,74,0.55)' }}>
+        <div className="text-[11px] text-dust">Production mapper output table is not available yet. Run the hourly mapper to populate taxonomy_call_cluster_outputs.</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))' }}>
+        <MetricCard label="Latest Run" value={String(latestRun).replace('mapper_', '').slice(0, 18) || '—'} color="#00d4ff" icon={Activity} note={summary.mapper_window_start && summary.mapper_window_end ? `${new Date(summary.mapper_window_start).toLocaleString()} → ${new Date(summary.mapper_window_end).toLocaleString()}` : 'No mapper window returned.'} />
+        <MetricCard label="Mapped Labels" value={fmt(totalRows)} color="#a855f7" icon={Layers} note={`${fmt(n(summary.distinct_calls))} distinct calls processed in the latest mapper run.`} />
+        <MetricCard label="Existing Cluster" value={existingRate != null ? pct(existingRate, 1) : '—'} color="#10b981" icon={CheckCircle} note={`${fmt(existingRows)} labels safely mapped into approved taxonomy clusters.`} />
+        <MetricCard label="Emerging" value={fmt(emergingRows)} color={emergingRows ? '#f97316' : '#10b981'} icon={AlertTriangle} note={`${fmt(n(summary.new_cluster_candidate_rows))} new-cluster candidates, ${fmt(n(summary.true_anomaly_rows))} low-similarity anomalies.`} />
+        <MetricCard label="Config Issues" value={fmt(configRows)} color={configRows ? '#ef4444' : '#10b981'} icon={Database} note="Rows with no active cluster reference for the field." />
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-[1.2fr_1fr] gap-4">
+        <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(26,45,74,0.55)' }}>
+          <div className="px-4 py-3 flex items-center justify-between gap-3" style={{ background: 'rgba(255,255,255,0.022)', borderBottom: '1px solid rgba(26,45,74,0.45)' }}>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.2em] text-dust font-bold">Field Mapping Health</div>
+              <div className="text-[10px] text-dust/70 mt-1">Latest run distribution by taxonomy field.</div>
+            </div>
+            <span className="text-[10px] text-dust font-mono">{fmt(fields.length)} fields</span>
+          </div>
+          <div className="overflow-x-auto max-h-[320px]" style={{ scrollbarWidth: 'thin', scrollbarColor: '#1a2d4a transparent' }}>
+            <table className="w-full min-w-[820px] text-left text-[10.5px]">
+              <thead style={{ background: 'rgba(255,255,255,0.018)', color: '#64748b' }}>
+                <tr>
+                  <th className="px-3 py-2 font-semibold">Field</th>
+                  <th className="px-3 py-2 font-semibold text-right">Rows</th>
+                  <th className="px-3 py-2 font-semibold text-right">Calls</th>
+                  <th className="px-3 py-2 font-semibold text-right">Exact</th>
+                  <th className="px-3 py-2 font-semibold text-right">Centroid</th>
+                  <th className="px-3 py-2 font-semibold text-right">Existing</th>
+                  <th className="px-3 py-2 font-semibold text-right">Emerging</th>
+                  <th className="px-3 py-2 font-semibold text-right">Avg Sim</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fields.map(f => {
+                  const emergingCount = n(f.new_cluster_candidate_rows) + n(f.true_anomaly_rows)
+                  const existing = f.existing_cluster_rate != null ? Number(f.existing_cluster_rate) : rate(f.existing_cluster_rows, f.total_rows)
+                  return (
+                    <tr key={f.field_name} style={{ borderTop: '1px solid rgba(26,45,74,0.35)' }}>
+                      <td className="px-3 py-2 truncate font-semibold" style={{ color: getFieldColor(f.field_name) }}>{f.field_name}</td>
+                      <td className="px-3 py-2 text-right text-dust font-mono">{fmt(f.total_rows)}</td>
+                      <td className="px-3 py-2 text-right text-dust font-mono">{fmt(f.distinct_calls)}</td>
+                      <td className="px-3 py-2 text-right text-dust font-mono">{fmt(f.exact_label_map_rows)}</td>
+                      <td className="px-3 py-2 text-right text-dust font-mono">{fmt(f.centroid_similarity_rows)}</td>
+                      <td className="px-3 py-2 text-right font-mono" style={{ color: existing >= 0.98 ? '#10b981' : '#f97316' }}>{existing != null ? pct(existing, 1) : '—'}</td>
+                      <td className="px-3 py-2 text-right font-mono" style={{ color: emergingCount ? '#f97316' : '#64748b' }}>{fmt(emergingCount)}</td>
+                      <td className="px-3 py-2 text-right text-dust font-mono">{f.avg_similarity != null ? Number(f.avg_similarity).toFixed(3) : '—'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+            {!fields.length && <div className="p-4 text-[11px] text-dust">No production field health rows returned.</div>}
+          </div>
+        </div>
+
+        <div className="rounded-xl overflow-hidden" style={{ border: '1px solid rgba(26,45,74,0.55)' }}>
+          <div className="px-4 py-3" style={{ background: 'rgba(255,255,255,0.022)', borderBottom: '1px solid rgba(26,45,74,0.45)' }}>
+            <div className="text-[9px] uppercase tracking-[0.2em] text-dust font-bold">Emerging Watchlist</div>
+            <div className="text-[10px] text-dust/70 mt-1">Production labels not safe enough for canonical mapping.</div>
+          </div>
+          <div className="max-h-[320px] overflow-y-auto p-3 flex flex-col gap-2" style={{ scrollbarWidth: 'thin', scrollbarColor: '#1a2d4a transparent' }}>
+            {emerging.map((row, i) => {
+              let candidates = row.top_candidates
+              if (typeof candidates === 'string') {
+                try { candidates = JSON.parse(candidates) } catch { candidates = [] }
+              }
+              const top = safeArray(candidates)[0]
+              const color = row.mapping_status === 'TRUE_ANOMALY' ? '#ef4444' : '#f97316'
+              return (
+                <div key={`${row.source_record_id}-${row.field_name}-${row.normalized_label}-${i}`} className="rounded-xl px-3 py-2" style={{ background: `${color}08`, border: `1px solid ${color}24` }}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-[11px] text-star truncate">{row.raw_label}</span>
+                    <span className="text-[9.5px] px-2 py-0.5 rounded-md font-semibold" style={{ color, background: `${color}14`, border: `1px solid ${color}28` }}>{normalizeLabel(row.mapping_status)}</span>
+                  </div>
+                  <div className="mt-1 text-[9.5px] truncate" style={{ color: getFieldColor(row.field_name) }}>{row.field_name}</div>
+                  <div className="mt-1 text-[10px] leading-snug" style={{ color: '#64748b' }}>
+                    Nearest: {top?.display_name || top?.cluster_name || row.mapped_display_name || '—'} · score {row.similarity_score != null ? Number(row.similarity_score).toFixed(3) : '—'}
+                  </div>
+                </div>
+              )
+            })}
+            {!emerging.length && <div className="flex items-center gap-2 text-[11px] text-dust"><CheckCircle size={13} /> No emerging labels in the latest mapper run.</div>}
+            {configIssues.length > 0 && <div className="mt-2 text-[10px] text-rose-300">{fmt(configIssues.length)} config issue rows need active cluster references.</div>}
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-xl p-4" style={{ background: 'rgba(255,255,255,0.022)', border: '1px solid rgba(26,45,74,0.55)' }}>
+        <div className="text-[9px] uppercase tracking-[0.2em] text-dust mb-3 font-bold">Recent Mapper Runs</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2">
+          {safeArray(runs?.runs).slice(0, 8).map(r => (
+            <div key={r.mapper_run_id} className="rounded-lg px-3 py-2" style={{ background: 'rgba(3,8,15,0.72)', border: '1px solid rgba(26,45,74,0.42)' }}>
+              <div className="text-[10px] text-star font-mono truncate">{String(r.mapper_run_id || '').replace('mapper_', '')}</div>
+              <div className="text-[9.5px] text-dust mt-1">{fmt(r.total_rows)} labels · {fmt(r.distinct_calls)} calls</div>
+              <div className="text-[9.5px] mt-1" style={{ color: n(r.new_cluster_candidate_rows) || n(r.true_anomaly_rows) ? '#f97316' : '#10b981' }}>{fmt(n(r.new_cluster_candidate_rows) + n(r.true_anomaly_rows))} emerging</div>
+            </div>
+          ))}
+          {!safeArray(runs?.runs).length && <div className="text-[11px] text-dust">No mapper run metadata returned.</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function OverviewPage() {
   const { health, setSelectedClusterId } = useAppCtx()
   const [data, setData] = useState({})
@@ -249,7 +377,9 @@ export default function OverviewPage() {
       fetch('/api/drift-summary').then(r => r.json()),
       fetch('/api/run-metadata').then(r => r.ok ? r.json() : r.json().catch(() => ({ runs: [], table_exists: null, _status: r.status }))),
       fetch('/api/review-priorities').then(r => r.json()),
-    ]).then(([compression, anomalies, medoid, fieldHealth, duplicates, recovery, drift, runMetadata, priorities]) => {
+      fetch('/api/production-mapper/summary').then(r => r.json()),
+      fetch('/api/production-mapper/runs').then(r => r.json()),
+    ]).then(([compression, anomalies, medoid, fieldHealth, duplicates, recovery, drift, runMetadata, priorities, productionMapper, productionRuns]) => {
       if (cancelled) return
       setData({
         compression: compression.status === 'fulfilled' ? compression.value : null,
@@ -261,6 +391,8 @@ export default function OverviewPage() {
         drift: drift.status === 'fulfilled' ? drift.value : null,
         runMetadata: runMetadata.status === 'fulfilled' ? runMetadata.value : { runs: [], table_exists: null, _unreachable: true },
         priorities: priorities.status === 'fulfilled' ? priorities.value : [],
+        productionMapper: productionMapper.status === 'fulfilled' ? productionMapper.value : { available: false },
+        productionRuns: productionRuns.status === 'fulfilled' ? productionRuns.value : { available: false, runs: [] },
       })
     }).finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
@@ -271,6 +403,9 @@ export default function OverviewPage() {
   const anomalyByField = safeArray(data.anomalies?.summary?.by_field)
   const priorities = safeArray(data.priorities)
   const runRows = safeArray(data.runMetadata?.runs)
+  const productionSummary = data.productionMapper?.summary || null
+  const productionEmergingCount = n(productionSummary?.new_cluster_candidate_rows) + n(productionSummary?.true_anomaly_rows)
+  const productionConfigIssueCount = n(productionSummary?.no_cluster_reference_rows)
   const medoidByField = safeArray(data.medoid?.by_field)
   const recoveryByField = safeArray(data.recovery?.by_field)
 
@@ -379,6 +514,12 @@ export default function OverviewPage() {
 
   const actionItems = useMemo(() => {
     const items = []
+    if (productionEmergingCount > 0) {
+      items.push({ title: 'Production emerging labels', severity: 'warning', metric: fmt(productionEmergingCount), detail: 'Latest mapper run found labels that should stay in the emerging watchlist instead of being forced into approved clusters.', target: 'production' })
+    }
+    if (productionConfigIssueCount > 0) {
+      items.push({ title: 'Production config issues', severity: 'critical', metric: fmt(productionConfigIssueCount), detail: 'Some production rows have no active cluster reference for their field.', target: 'production' })
+    }
     if (centroidMissing > 0) {
       items.push({ title: 'Centroid rebuild needed', severity: 'critical', metric: fmt(centroidMissing), detail: `${fmt(centroidMissing)} clusters are missing centroid coverage. Rebuild centroids before trusting semantic distance or medoid quality.` })
     }
@@ -399,7 +540,7 @@ export default function OverviewPage() {
       items.push({ title: 'No urgent taxonomy blockers', severity: 'good', detail: 'Current health signals do not expose urgent missing coverage, duplicate-name, or weak-medoid issues.' })
     }
     return items.slice(0, 6)
-  }, [centroidMissing, data.medoid, data.drift, sameFieldDupes, highestAnomaly])
+  }, [centroidMissing, data.medoid, data.drift, sameFieldDupes, highestAnomaly, productionEmergingCount, productionConfigIssueCount])
 
   function openCluster(id) {
     if (id) setSelectedClusterId(id)
@@ -429,6 +570,10 @@ export default function OverviewPage() {
               <MetricCard label="Merge Risk" value={fmt(sameFieldDupes)} color="#06b6d4" icon={Target} note={`${fmt(sameFieldDupes)} same-field duplicate-name groups. ${fmt(crossFieldDupes)} cross-field overlaps are tracked separately.`} onClick={() => scrollToSection('merge')} />
               <MetricCard label="Coverage" value={namedRate != null ? pct(namedRate) : '—'} color="#00d4ff" icon={Database} note={`${fmt(totalCoveredLabels)} label-map rows covered by active taxonomy surfaces.`} onClick={() => scrollToSection('coverage')} />
             </div>
+          </Panel>
+
+          <Panel id="production" title="Production Mapping" subtitle="hourly mapper output from Iris-facing canonical, emerging, and config feeds" icon={Activity}>
+            <ProductionMappingPanel production={data.productionMapper} runs={data.productionRuns} />
           </Panel>
 
           <Panel id="actions" title="Action Queue" subtitle="prioritized review work generated from the available signals" icon={Zap}>
