@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, lazy, Suspense } from 'react'
-import { RotateCcw, Map as MapIcon, Orbit, Search, SlidersHorizontal, Minus, Plus, Maximize2, Table2, Columns, LayoutDashboard } from 'lucide-react'
+import { RotateCcw, Map as MapIcon, Orbit, Search, SlidersHorizontal, Minus, Plus, Maximize2, Table2, Columns, LayoutDashboard, X } from 'lucide-react'
 import useStore from '../store/useStore.js'
 import RightInspector from '../components/layout/RightInspector.jsx'
 import ClusterTable from '../components/ClusterTable.jsx'
 import { getFieldColor } from '../components/scene/sceneUtils.js'
+import { fetchJson } from '../utils/api.js'
 
 const SemanticScene = lazy(() => import('../components/scene/SemanticScene.jsx'))
 
@@ -185,6 +186,93 @@ function SceneLoader({ label = 'Initializing…' }) {
   )
 }
 
+
+function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear }) {
+  const active = searchState?.active
+  const loading = searchState?.loading
+  const results = searchState?.results || []
+  const top = results.slice(0, 4)
+  const scoped = selectedFields?.length === 1 ? selectedFields[0] : null
+
+  return (
+    <CtrlSection label="Semantic Search">
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center gap-1.5 rounded-lg px-2 py-1.5"
+          style={{ background: 'rgba(3,8,15,0.78)', border: `1px solid ${active ? 'rgba(168,85,247,0.40)' : 'rgba(26,45,74,0.65)'}` }}>
+          <Search size={11} style={{ color: active ? '#a855f7' : '#64748b', flexShrink: 0 }} />
+          <input
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') onSearch() }}
+            placeholder="aggressive, rude, confused..."
+            className="w-full bg-transparent outline-none text-[10px] text-star placeholder:text-slate-600"
+          />
+          {(query || active) && (
+            <button onClick={onClear} className="w-4 h-4 flex items-center justify-center rounded text-slate-500 hover:text-cyan">
+              <X size={11} />
+            </button>
+          )}
+        </div>
+
+        <button onClick={onSearch} disabled={loading || !query.trim()}
+          className="w-full flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-[9.5px] font-semibold transition-all duration-150 disabled:opacity-45 disabled:cursor-not-allowed"
+          style={{ background: 'rgba(168,85,247,0.12)', border: '1px solid rgba(168,85,247,0.32)', color: '#c084fc' }}>
+          {loading ? 'Searching embeddings…' : 'Find semantic clusters'}
+        </button>
+
+        {scoped && !active && (
+          <div className="text-[8.5px] leading-snug" style={{ color: '#334155' }}>
+            Search will run inside {scoped}. Clear field chips to search all fields.
+          </div>
+        )}
+
+        {searchState?.error && (
+          <div className="text-[8.5px] leading-snug rounded-lg px-2 py-1.5"
+            style={{ color: '#fb7185', background: 'rgba(244,63,94,0.08)', border: '1px solid rgba(244,63,94,0.22)' }}>
+            {searchState.error}
+          </div>
+        )}
+
+        {active && !searchState?.error && (
+          <div className="rounded-lg px-2 py-2 flex flex-col gap-1.5"
+            style={{ background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.24)' }}>
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] font-semibold" style={{ color: '#c084fc' }}>{results.length.toLocaleString()} semantic matches</span>
+              <span className="text-[8px] font-mono" style={{ color: '#7e22ce' }}>{searchState.engine || 'embedding'}</span>
+            </div>
+            <div className="text-[8.5px] leading-snug" style={{ color: '#64748b' }}>
+              Showing clusters ranked by matched label embeddings for “{searchState.query}”.
+            </div>
+            {top.length > 0 && (
+              <div className="flex flex-col gap-1 pt-1">
+                {top.map(r => {
+                  const fc = getFieldColor(r.field_name)
+                  return (
+                    <button key={`${r.field_name}:${r.cluster_id}`} onClick={() => r.id && window.dispatchEvent(new CustomEvent('semantic-search-select', { detail: { id: r.id } }))}
+                      className="text-left rounded-md px-2 py-1.5"
+                      style={{ background: 'rgba(3,8,15,0.55)', border: `1px solid ${fc}22` }}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[9.5px] truncate" style={{ color: '#cbd5e1' }}>{r.display_name || r.medoid_label || r.cluster_id}</span>
+                        <span className="text-[8.5px] font-mono" style={{ color: '#c084fc' }}>{Math.round((r.semantic_score || 0) * 100)}%</span>
+                      </div>
+                      <div className="text-[8px] truncate" style={{ color: '#64748b' }}>{r.semantic_best_label || 'matched label unavailable'}</div>
+                      {Array.isArray(r.sample_call_ids) && r.sample_call_ids.length > 0 && (
+                        <div className="text-[7.5px] truncate font-mono" style={{ color: '#475569' }} title={r.sample_call_ids.join(', ')}>
+                          calls: {r.sample_call_ids.slice(0, 3).join(', ')}{r.sample_call_ids.length > 3 ? '…' : ''}
+                        </div>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </CtrlSection>
+  )
+}
+
 // ── Observatory ────────────────────────────────────────────────────────────────
 export default function Observatory() {
   const {
@@ -210,6 +298,8 @@ export default function Observatory() {
   const [sizeFilter,     setSizeFilter]     = useState(1)
   const [showProduction, setShowProduction] = useState(false)
   const [productionOverlay, setProductionOverlay] = useState({ available: false, rows: [], latest_run_id: null })
+  const [semanticQuery, setSemanticQuery] = useState('')
+  const [semanticSearch, setSemanticSearch] = useState({ active: false, query: '', results: [], loading: false, error: null, engine: null })
 
   const sendSceneCommand = (action) => {
     window.dispatchEvent(new CustomEvent('semantic-scene-command', { detail: { action } }))
@@ -221,6 +311,49 @@ export default function Observatory() {
   }
 
   const selectedFields = activeFields?.length ? activeFields : (activeField ? [activeField] : [])
+
+  const clearSemanticSearch = () => {
+    setSemanticQuery('')
+    setSemanticSearch({ active: false, query: '', results: [], loading: false, error: null, engine: null })
+  }
+
+  const runSemanticSearch = async (overrideQuery) => {
+    const q = String(overrideQuery ?? semanticQuery).trim()
+    if (!q) {
+      clearSemanticSearch()
+      return
+    }
+
+    setSelectedClusterId(null)
+    setSemanticSearch(prev => ({ ...prev, active: true, query: q, loading: true, error: null, results: [] }))
+
+    try {
+      const params = new URLSearchParams({ q, limit: '120', min_score: '0.30', label_limit: '1200' })
+      if (selectedFields.length === 1) params.set('field_name', selectedFields[0])
+      params.set('include_calls', 'true')
+      params.set('sample_call_limit', '8')
+      const payload = await fetchJson(`/api/semantic-search?${params}`, {}, 'Semantic search')
+      setSemanticSearch({
+        active: true,
+        query: payload.normalized_query || payload.query || q,
+        results: Array.isArray(payload.results) ? payload.results : [],
+        loading: false,
+        error: null,
+        engine: payload.engine || null,
+        model: payload.model || null,
+      })
+    } catch (err) {
+      setSemanticSearch({ active: true, query: q, results: [], loading: false, error: err.message || 'Semantic search failed', engine: null })
+    }
+  }
+
+  useEffect(() => {
+    function onSelect(event) {
+      if (event?.detail?.id) setSelectedClusterId(event.detail.id)
+    }
+    window.addEventListener('semantic-search-select', onSelect)
+    return () => window.removeEventListener('semantic-search-select', onSelect)
+  }, [setSelectedClusterId])
 
   useEffect(() => {
     setLoading(true)
@@ -293,7 +426,37 @@ export default function Observatory() {
     })
   }, [clusters, showProduction, productionOverlayMap])
 
-  const displayClusters = clustersWithProduction.filter(c => {
+  const semanticResultMap = useMemo(() => {
+    const map = new Map()
+    for (const r of semanticSearch?.results || []) {
+      if (!r?.field_name || !r?.cluster_id) continue
+      map.set(`${r.field_name}:${r.cluster_id}`, r)
+    }
+    return map
+  }, [semanticSearch])
+
+  const clustersWithSemantic = useMemo(() => {
+    if (!semanticSearch?.active || !semanticResultMap.size) return clustersWithProduction
+    return clustersWithProduction
+      .map(c => {
+        const hit = semanticResultMap.get(`${c.field_name}:${c.cluster_id}`)
+        if (!hit) return null
+        return {
+          ...c,
+          semantic_search_score: hit.semantic_score,
+          semantic_best_label: hit.semantic_best_label,
+          semantic_matched_labels: hit.semantic_matched_labels || [],
+          semantic_match_count: hit.matched_label_count,
+          semantic_matched_occurrences: hit.matched_occurrences,
+          semantic_distinct_calls: hit.semantic_distinct_calls,
+          sample_call_ids: hit.sample_call_ids || [],
+          call_id_source: hit.call_id_source || null,
+        }
+      })
+      .filter(Boolean)
+  }, [clustersWithProduction, semanticSearch, semanticResultMap])
+
+  const displayClusters = clustersWithSemantic.filter(c => {
     if (selectedFields.length && !selectedFields.includes(c.field_name)) return false
     if (anomalyFilter === 'anomaly'  && !c.is_true_anomaly_cluster) return false
     if (anomalyFilter === 'standard' &&  c.is_true_anomaly_cluster) return false
@@ -301,7 +464,7 @@ export default function Observatory() {
     return true
   })
 
-  const fieldGroups = clustersWithProduction.reduce((acc, c) => {
+  const fieldGroups = clustersWithSemantic.reduce((acc, c) => {
     acc[c.field_name] = (acc[c.field_name] || 0) + 1; return acc
   }, {})
   const fields = Object.entries(fieldGroups).sort((a, b) => b[1] - a[1])
@@ -431,6 +594,15 @@ export default function Observatory() {
             </div>
           </CtrlSection>
 
+          <SemanticSearchPanel
+            query={semanticQuery}
+            setQuery={setSemanticQuery}
+            searchState={semanticSearch}
+            selectedFields={selectedFields}
+            onSearch={runSemanticSearch}
+            onClear={clearSemanticSearch}
+          />
+
           {/* Production overlay */}
           <CtrlSection label="Production">
             <div className="flex flex-col gap-1.5">
@@ -461,7 +633,7 @@ export default function Observatory() {
                 <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
                   style={{ background: !selectedFields.length ? '#00d4ff' : '#1e3450', boxShadow: !selectedFields.length ? '0 0 5px #00d4ff' : 'none' }} />
                 <span className="flex-1 text-[10px]" style={{ color: !selectedFields.length ? '#00d4ff' : '#475569' }}>All Fields</span>
-                <span className="text-[9px]" style={{ color: !selectedFields.length ? '#00d4ff88' : '#334155' }}>{clustersWithProduction.length}</span>
+                <span className="text-[9px]" style={{ color: !selectedFields.length ? '#00d4ff88' : '#334155' }}>{clustersWithSemantic.length}</span>
               </button>
               {fields.map(([field, count]) => (
                 <FieldChip key={field} field={field} count={count}
@@ -520,6 +692,7 @@ export default function Observatory() {
                 ['Medoid', '#f97316', 'diamond'],
                 ['Anomaly', '#ec4899', 'dot'],
                 ...(showProduction ? [['Production hit', '#10b981', 'ring']] : []),
+                ...(semanticSearch?.active ? [['Semantic match', '#a855f7', 'ring']] : []),
               ].map(([label, color, kind]) => (
                 <div key={label} className="flex items-center gap-1 text-[10px] text-star">
                   {kind === 'diamond' ? <span className="w-2 h-2 rotate-45" style={{ border: `2px solid ${color}` }} />
@@ -536,18 +709,13 @@ export default function Observatory() {
                 style={{ background: 'rgba(3,8,15,0.82)', border: '1px solid rgba(71,85,105,0.42)', backdropFilter: 'blur(14px)' }}>
                 <Search size={12} style={{ color: '#94a3b8' }} />
                 <input
-                  placeholder="Search cluster or label..."
+                  placeholder="Semantic search labels..."
                   className="w-full bg-transparent outline-none text-[10px] text-star placeholder:text-slate-500"
+                  defaultValue={semanticQuery}
+                  onChange={e => setSemanticQuery(e.target.value)}
                   onKeyDown={e => {
                     if (e.key !== 'Enter') return
-                    const q = e.currentTarget.value.trim().toLowerCase()
-                    if (!q) return
-                    const hit = displayClusters.find(c =>
-                      String(c.display_name || '').toLowerCase().includes(q) ||
-                      String(c.medoid_label || '').toLowerCase().includes(q) ||
-                      String(c.cluster_id || c.id || '').toLowerCase().includes(q)
-                    )
-                    if (hit) setSelectedClusterId(hit.id || hit.cluster_id)
+                    runSemanticSearch(e.currentTarget.value)
                   }}
                 />
               </div>

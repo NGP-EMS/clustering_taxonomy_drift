@@ -80,11 +80,34 @@ function selectedMedoidOffset(cluster, scale = 1) {
   return { dx: Math.cos(angle) * gap, dy: Math.sin(angle) * gap, sim }
 }
 
+
+function drawSemanticRing(ctx, x, y, r, score, alpha = 1) {
+  const s = Number(score)
+  if (!Number.isFinite(s) || s <= 0) return
+  const ringR = Math.max(r + 5, 5)
+  ctx.save()
+  ctx.globalAlpha = Math.min(1, alpha)
+  ctx.beginPath()
+  ctx.arc(x, y, ringR, 0, Math.PI * 2)
+  ctx.strokeStyle = '#a855f7'
+  ctx.lineWidth = Math.max(1.4, Math.min(3, 1.2 + s * 1.8))
+  ctx.setLineDash([5, 3])
+  ctx.stroke()
+  ctx.setLineDash([])
+  ctx.beginPath()
+  ctx.arc(x, y, ringR + 3, 0, Math.PI * 2)
+  ctx.strokeStyle = 'rgba(168,85,247,0.25)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.restore()
+}
+
 function drawTooltip(ctx, c, px, py, w, h) {
   const title = c.display_name || c.medoid_label || c.cluster_id || 'Unnamed'
   const titleT = title.length > 36 ? title.slice(0, 36) + '…' : title
   const prod = c.production_hit_count ? ` · ${Number(c.production_hit_count).toLocaleString()} production hits` : ''
-  const sub = `${(c.cluster_size || 0).toLocaleString()} items · ${c.field_name || ''}${prod}`
+  const sem = c.semantic_search_score ? ` · semantic ${Math.round(Number(c.semantic_search_score) * 100)}%` : ''
+  const sub = `${(c.cluster_size || 0).toLocaleString()} items · ${c.field_name || ''}${prod}${sem}`
   ctx.save()
   ctx.font = '600 11px Inter,system-ui,sans-serif'
   const tw = Math.max(ctx.measureText(titleT).width, ctx.measureText(sub).width)
@@ -195,6 +218,7 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
       ctx.stroke()
       ctx.setLineDash([])
     }
+    drawSemanticRing(ctx, px, py, r, c.semantic_search_score, cls.length > 2500 ? 0.55 : 0.82)
   }
   ctx.globalAlpha = 1
 
@@ -240,6 +264,7 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
       ctx.fillStyle = '#10b981'
       ctx.fillText(`${Number(focusC.production_hit_count).toLocaleString()} prod`, px + r + 8, py - r - 3)
     }
+    drawSemanticRing(ctx, px, py, r, focusC.semantic_search_score, 1)
 
     if (isSel) {
       const { dx, dy, sim } = selectedMedoidOffset(focusC, 1)
@@ -380,6 +405,7 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
       ctx.beginPath(); ctx.arc(px, py, Math.max(r + 3, 4), 0, Math.PI * 2)
       ctx.strokeStyle = '#10b981'; ctx.lineWidth = 1.3; ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([])
     }
+    drawSemanticRing(ctx, px, py, r, c.semantic_search_score, Math.min(1, alpha + 0.1))
   }
   ctx.globalAlpha = 1
 
@@ -439,6 +465,7 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
       ctx.fillStyle = '#10b981'
       ctx.fillText(`${Number(c.production_hit_count).toLocaleString()} prod`, px + r + 8, py - r - 3)
     }
+    drawSemanticRing(ctx, px, py, r, c.semantic_search_score, 1)
 
     if (isSel) {
       const { dx, dy, sim } = selectedMedoidOffset(c, 0.82)

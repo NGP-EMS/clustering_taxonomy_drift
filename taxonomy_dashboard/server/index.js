@@ -3,6 +3,7 @@
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
+const { spawn } = require('child_process');
 
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
@@ -34,6 +35,306 @@ async function tableExists(tableName) {
   return _tableCache[tableName];
 }
 
+
+async function getColInfo(tableName) {
+  const { rows } = await pool.query(
+    `SELECT column_name, data_type, udt_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = $1`,
+    [tableName]
+  );
+  return Object.fromEntries(rows.map(r => [r.column_name, r]));
+}
+
+function pickCol(cols, names) {
+  for (const name of names) if (cols.has(name)) return name;
+  return null;
+}
+
+function vectorLiteral(arr) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  return `[${arr.map(v => Number(v).toFixed(8)).join(',')}]`;
+}
+
+function numericParam(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function normalizeSemanticQueryText(text) {
+  return String(text || '')
+    .replace(/\bagressive\b/gi, 'aggressive')
+    .replace(/\bagression\b/gi, 'aggression')
+    .trim();
+}
+
+
+class SemanticEmbeddingWorker {
+  constructor() {
+    this.child = null;
+    this.ready = false;
+    this.readyPromise = null;
+    this.pending = new Map();
+    this.buffer = '';
+    this.nextId = 1;
+    this.lastStart = 0;
+  }
+
+  start() {
+    if (this.child && !this.child.killed) return this.readyPromise;
+
+    const now = Date.now();
+    if (now - this.lastStart < 1000) {
+      return this.readyPromise || Promise.reject(new Error('Semantic embedding worker restart throttled'));
+    }
+    this.lastStart = now;
+
+    const pythonExec = process.env.SEMANTIC_SEARCH_PYTHON || process.env.PYTHON || 'python';
+    const scriptPath = path.resolve(__dirname, 'embed_worker.py');
+    this.ready = false;
+    this.buffer = '';
+
+    this.child = spawn(pythonExec, ['-u', scriptPath], {
+      cwd: path.resolve(__dirname, '..'),
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const startupTimeoutMs = parseInt(process.env.SEMANTIC_EMBED_STARTUP_TIMEOUT_MS || '180000', 10);
+    this.readyPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Semantic embedding worker startup timed out after ${startupTimeoutMs}ms`));
+      }, startupTimeoutMs);
+
+      const finishReady = payload => {
+        clearTimeout(timer);
+        this.ready = true;
+        resolve(payload);
+      };
+
+      this._finishReady = finishReady;
+      this._failReady = err => {
+        clearTimeout(timer);
+        reject(err);
+      };
+    });
+
+    this.child.stdout.on('data', d => this.handleStdout(d));
+    this.child.stderr.on('data', d => {
+      const msg = d.toString().trim();
+      if (msg) console.warn('[semantic-embed-worker]', msg);
+    });
+    this.child.on('error', err => this.failAll(err));
+    this.child.on('close', code => {
+      const err = new Error(`Semantic embedding worker exited with code ${code}`);
+      this.ready = false;
+      this.child = null;
+      if (this._failReady) this._failReady(err);
+      this.failAll(err);
+    });
+
+    return this.readyPromise;
+  }
+
+  handleStdout(chunk) {
+    this.buffer += chunk.toString();
+    let idx;
+    while ((idx = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + 1);
+      if (!line) continue;
+
+      let payload;
+      try {
+        payload = JSON.parse(line);
+      } catch (err) {
+        console.warn('[semantic-embed-worker] non-json stdout:', line.slice(0, 200));
+        continue;
+      }
+
+      if (payload.type === 'ready') {
+        if (this._finishReady) this._finishReady(payload);
+        continue;
+      }
+
+      const id = payload.id;
+      if (!id || !this.pending.has(id)) continue;
+      const item = this.pending.get(id);
+      this.pending.delete(id);
+      clearTimeout(item.timer);
+
+      if (payload.error) {
+        item.reject(new Error(payload.error));
+      } else if (!payload.embedding) {
+        item.reject(new Error('Semantic embedding worker returned no embedding'));
+      } else {
+        item.resolve({
+          embedding: payload.embedding,
+          model: payload.model || null,
+          dimension: payload.dimension || payload.embedding.length,
+        });
+      }
+    }
+  }
+
+  failAll(err) {
+    for (const [, item] of this.pending) {
+      clearTimeout(item.timer);
+      item.reject(err);
+    }
+    this.pending.clear();
+  }
+
+  async embed(text) {
+    const query = String(text || '').trim();
+    if (!query) throw new Error('Missing semantic search query');
+
+    await this.start();
+
+    const requestTimeoutMs = parseInt(process.env.SEMANTIC_EMBED_REQUEST_TIMEOUT_MS || '30000', 10);
+    const id = String(this.nextId++);
+
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Semantic query embedding request timed out after ${requestTimeoutMs}ms`));
+      }, requestTimeoutMs);
+
+      this.pending.set(id, { resolve, reject, timer });
+
+      try {
+        this.child.stdin.write(`${JSON.stringify({ id, query })}\n`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+}
+
+const semanticEmbeddingWorker = new SemanticEmbeddingWorker();
+
+async function embedSemanticQuery(text) {
+  return semanticEmbeddingWorker.embed(text);
+}
+
+// Preload the model when the API starts so the first dashboard search does not
+// pay the full SentenceTransformers import/model-load cost.
+semanticEmbeddingWorker.start().catch(err => {
+  console.warn('[semantic-embed-worker] preload failed:', err.message);
+});
+
+async function getLabelEmbeddingConfig() {
+  if (!(await tableExists('taxonomy_label_embeddings'))) return null;
+  const cols = await getCols('taxonomy_label_embeddings');
+  const info = await getColInfo('taxonomy_label_embeddings');
+  const embeddingCol = pickCol(cols, ['embedding', 'label_embedding', 'embedding_vector', 'label_vector', 'vector', 'text_embedding']);
+  if (!embeddingCol) return null;
+  return {
+    cols,
+    info,
+    embeddingCol,
+    fieldCol: pickCol(cols, ['field_name', 'field']),
+    rawCol: pickCol(cols, ['raw_label', 'label', 'original_label']),
+    normCol: pickCol(cols, ['normalized_label', 'normalized_key', 'clean_label']),
+    isPgVector: String(info[embeddingCol]?.udt_name || '').toLowerCase() === 'vector',
+  };
+}
+
+function buildLabelMapJoin({ lmCols, hitAlias = 'h', lmAlias = 'lm' }) {
+  const parts = [];
+  if (lmCols.has('field_name')) parts.push(`${lmAlias}.field_name = ${hitAlias}.field_name`);
+  const labelParts = [];
+  if (lmCols.has('raw_label')) labelParts.push(`${lmAlias}.raw_label = ${hitAlias}.raw_label`);
+  if (lmCols.has('normalized_label')) labelParts.push(`${lmAlias}.normalized_label = ${hitAlias}.normalized_label`);
+  if (!labelParts.length) return null;
+  parts.push(`(${labelParts.join(' OR ')})`);
+  return parts.join(' AND ');
+}
+
+function semanticResultSelectSql(tcCols, tcnCols, lmCols) {
+  const aCol = anomalyColSql(tcCols, 'tc');
+  const lmCC = lmCols.has('final_cluster_id') ? 'final_cluster_id' : 'cluster_id';
+  const clusterRunExpr = tcCols.has('run_id') ? `COALESCE(tc.run_id, '')` : `''`;
+  const clusterVersionExpr = tcCols.has('cluster_version') ? `COALESCE(tc.cluster_version, 'v1')` : `'v1'`;
+  const activeFilter = tcCols.has('active') ? 'AND COALESCE(tc.active, true) = true' : '';
+  const joinOn = [
+    'tc.cluster_id = ch.cluster_id',
+    lmCols.has('field_name') ? 'tc.field_name = ch.field_name' : null,
+    lmCols.has('run_id') && tcCols.has('run_id') ? "COALESCE(tc.run_id, '') = COALESCE(ch.run_id, '')" : null,
+  ].filter(Boolean).join(' AND ');
+
+  return {
+    lmCC,
+    activeFilter,
+    sql: `
+      ranked_labels AS (
+        SELECT
+          m.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.field_name, m.${lmCC}
+            ORDER BY m.similarity DESC NULLS LAST, m.value_count DESC NULLS LAST, m.raw_label
+          ) AS rn
+        FROM mapped_hits m
+        WHERE m.${lmCC} IS NOT NULL
+      ),
+      cluster_hits AS (
+        SELECT
+          rl.field_name,
+          ${lmCols.has('run_id') ? 'rl.run_id' : 'NULL::text AS run_id'},
+          rl.${lmCC} AS cluster_id,
+          MAX(rl.similarity)::double precision AS best_label_similarity,
+          AVG(rl.similarity)::double precision AS avg_label_similarity,
+          COUNT(*)::int AS matched_label_count,
+          COALESCE(SUM(COALESCE(rl.value_count, 1)), 0)::bigint AS matched_occurrences,
+          MAX(rl.raw_label) FILTER (WHERE rl.rn = 1) AS best_label,
+          JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+              'raw_label', rl.raw_label,
+              'normalized_label', rl.normalized_label,
+              'similarity', ROUND(rl.similarity::numeric, 4),
+              'value_count', rl.value_count
+            )
+            ORDER BY rl.similarity DESC NULLS LAST, rl.value_count DESC NULLS LAST
+          ) FILTER (WHERE rl.rn <= 8) AS matched_labels
+        FROM ranked_labels rl
+        GROUP BY rl.field_name, ${lmCols.has('run_id') ? 'rl.run_id,' : ''} rl.${lmCC}
+      )
+      SELECT
+        tc.id,
+        tc.field_name,
+        ${clusterRunExpr} AS run_id,
+        ${clusterVersionExpr} AS cluster_version,
+        tc.cluster_id,
+        ${tcCols.has('cluster_size') ? 'tc.cluster_size' : 'NULL::int AS cluster_size'},
+        ${tcCols.has('total_occurrences') ? 'tc.total_occurrences' : 'NULL::bigint AS total_occurrences'},
+        ${tcCols.has('medoid_label') ? 'tc.medoid_label' : 'NULL::text AS medoid_label'},
+        ${tcCols.has('representative_labels') ? 'tc.representative_labels::text AS representative_labels' : 'NULL::text AS representative_labels'},
+        ${tcCols.has('medoid_similarity_to_centroid') ? 'tc.medoid_similarity_to_centroid' : 'NULL::numeric AS medoid_similarity_to_centroid'},
+        ${aCol ? `${aCol} AS is_true_anomaly_cluster` : 'NULL::boolean AS is_true_anomaly_cluster'},
+        ${tcCols.has('centroid_embedding') ? 'CASE WHEN tc.centroid_embedding IS NOT NULL THEN true ELSE false END AS has_centroid' : 'NULL::boolean AS has_centroid'},
+        tcn.display_name,
+        tcn.naming_method,
+        ch.best_label_similarity,
+        ch.avg_label_similarity,
+        ROUND(((ch.best_label_similarity * 0.78) + (ch.avg_label_similarity * 0.22))::numeric, 4)::double precision AS semantic_score,
+        ch.matched_label_count,
+        ch.matched_occurrences,
+        ch.best_label AS semantic_best_label,
+        ch.matched_labels AS semantic_matched_labels
+      FROM cluster_hits ch
+      JOIN taxonomy_clusters tc ON ${joinOn}
+      LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
+      WHERE ((ch.best_label_similarity * 0.78) + (ch.avg_label_similarity * 0.22)) >= $MIN_SCORE
+        ${activeFilter}
+      ORDER BY semantic_score DESC, ch.best_label_similarity DESC, ${tcCols.has('total_occurrences') ? 'COALESCE(tc.total_occurrences, 0)' : tcCols.has('cluster_size') ? 'COALESCE(tc.cluster_size, 0)' : 'tc.id'} DESC
+      LIMIT $LIMIT
+    `,
+  };
+}
+
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 function nameJoinSql(tcCols, tcnCols, tcAlias = 'tc', tcnAlias = 'tcn') {
   let j = `${tcAlias}.field_name = ${tcnAlias}.field_name AND ${tcAlias}.cluster_id = ${tcnAlias}.cluster_id`;
@@ -50,7 +351,20 @@ function anomalyColSql(tcCols, alias = 'tc') {
 
 function parseEmbedding(value) {
   if (!value) return null;
-  const arr = Array.isArray(value) ? value : typeof value === 'string' ? JSON.parse(value) : null;
+  let arr = null;
+  if (Array.isArray(value)) {
+    arr = value;
+  } else if (typeof value === 'string') {
+    const text = value.trim();
+    try {
+      arr = JSON.parse(text);
+    } catch {
+      const body = (text.startsWith('[') && text.endsWith(']')) || (text.startsWith('{') && text.endsWith('}'))
+        ? text.slice(1, -1)
+        : text;
+      arr = body.split(',').map(v => Number(v.trim())).filter(Number.isFinite);
+    }
+  }
   if (!Array.isArray(arr) || !arr.length) return null;
   return arr.map(Number).filter(Number.isFinite);
 }
@@ -1776,6 +2090,327 @@ app.get('/api/production-mapper/semantic-overlay', async (req, res) => {
       rows: rows.map(r => ({ ...r, raw_labels: Array.isArray(r.raw_labels) ? r.raw_labels.slice(0, 6) : [] })),
     });
   } catch (err) { console.error('/api/production-mapper/semantic-overlay:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+
+
+
+function truthyQueryParam(value, defaultValue = true) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+async function attachSemanticCallSamples(rows, options = {}) {
+  const baseRows = Array.isArray(rows) ? rows : [];
+  const emptyMeta = {
+    available: false,
+    latest_mapper_run_id: null,
+    call_id_source: 'taxonomy_call_cluster_outputs.source_record_id',
+  };
+
+  if (!baseRows.length) return { rows: baseRows, meta: emptyMeta };
+  if (!(await tableExists('taxonomy_call_cluster_outputs'))) return { rows: baseRows, meta: emptyMeta };
+
+  const mapperRunId = options.mapperRunId || await latestMapperRunId();
+  if (!mapperRunId) return { rows: baseRows, meta: { ...emptyMeta, available: true } };
+
+  const sampleLimit = Math.floor(numericParam(options.sampleLimit, 8, 1, 25));
+  const pairs = baseRows
+    .filter(r => r?.field_name && r?.cluster_id)
+    .map(r => ({ field_name: String(r.field_name), cluster_id: String(r.cluster_id) }));
+
+  if (!pairs.length) {
+    return { rows: baseRows, meta: { ...emptyMeta, available: true, latest_mapper_run_id: mapperRunId } };
+  }
+
+  const fieldNames = pairs.map(p => p.field_name);
+  const clusterIds = pairs.map(p => p.cluster_id);
+
+  const { rows: callRows } = await pool.query(`
+    WITH requested AS (
+      SELECT * FROM unnest($2::text[], $3::text[]) AS r(field_name, cluster_id)
+    ),
+    matched AS (
+      SELECT
+        o.field_name,
+        o.mapped_cluster_id AS cluster_id,
+        o.source_record_id::text AS source_record_id,
+        o.classified_at
+      FROM taxonomy_call_cluster_outputs o
+      JOIN requested r
+        ON r.field_name = o.field_name
+       AND r.cluster_id = o.mapped_cluster_id
+      WHERE o.mapper_run_id = $1
+        AND o.mapping_status = 'EXISTING_CLUSTER'
+        AND o.source_record_id IS NOT NULL
+    ),
+    grouped AS (
+      SELECT
+        field_name,
+        cluster_id,
+        COUNT(*)::int AS production_rows,
+        COUNT(DISTINCT source_record_id)::int AS distinct_call_count,
+        MAX(classified_at) AS latest_classified_at
+      FROM matched
+      GROUP BY field_name, cluster_id
+    ),
+    ranked AS (
+      SELECT
+        field_name,
+        cluster_id,
+        source_record_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY field_name, cluster_id
+          ORDER BY classified_at DESC NULLS LAST, source_record_id
+        ) AS rn
+      FROM (
+        SELECT DISTINCT field_name, cluster_id, source_record_id, classified_at
+        FROM matched
+      ) d
+    )
+    SELECT
+      g.field_name,
+      g.cluster_id,
+      g.production_rows,
+      g.distinct_call_count,
+      g.latest_classified_at,
+      COALESCE(
+        ARRAY_AGG(r.source_record_id ORDER BY r.rn) FILTER (WHERE r.rn <= $4),
+        ARRAY[]::text[]
+      ) AS sample_call_ids
+    FROM grouped g
+    LEFT JOIN ranked r
+      ON r.field_name = g.field_name
+     AND r.cluster_id = g.cluster_id
+    GROUP BY g.field_name, g.cluster_id, g.production_rows, g.distinct_call_count, g.latest_classified_at
+  `, [mapperRunId, fieldNames, clusterIds, sampleLimit]);
+
+  const callMap = new Map(callRows.map(r => [`${r.field_name}:${r.cluster_id}`, r]));
+  const enriched = baseRows.map(r => {
+    const hit = callMap.get(`${r.field_name}:${r.cluster_id}`);
+    return {
+      ...r,
+      semantic_distinct_calls: hit?.distinct_call_count == null ? null : Number(hit.distinct_call_count),
+      semantic_production_rows: hit?.production_rows == null ? null : Number(hit.production_rows),
+      sample_call_ids: Array.isArray(hit?.sample_call_ids) ? hit.sample_call_ids : [],
+      latest_mapper_run_id: mapperRunId,
+      call_id_source: 'taxonomy_call_cluster_outputs.source_record_id',
+    };
+  });
+
+  return {
+    rows: enriched,
+    meta: {
+      available: true,
+      latest_mapper_run_id: mapperRunId,
+      call_id_source: 'taxonomy_call_cluster_outputs.source_record_id',
+    },
+  };
+}
+
+// ── GET /api/semantic-search ─────────────────────────────────────────────────
+app.get('/api/semantic-search', async (req, res) => {
+  try {
+    const query = String(req.query.q || req.query.query || '').trim();
+    if (!query) return res.status(400).json({ error: 'Missing q parameter' });
+
+    const fieldFilter = String(req.query.field_name || '').trim();
+    const limit = Math.floor(numericParam(req.query.limit, 60, 1, 200));
+    const labelLimit = Math.floor(numericParam(req.query.label_limit, 900, 50, 3000));
+    const minScore = numericParam(req.query.min_score, 0.34, -1, 1);
+    const includeCalls = truthyQueryParam(req.query.include_calls, true);
+    const sampleCallLimit = Math.floor(numericParam(req.query.sample_call_limit, 8, 1, 25));
+    const mapperRunId = req.query.mapper_run_id ? String(req.query.mapper_run_id) : null;
+    const fallbackCandidateLimit = Math.floor(numericParam(
+      req.query.candidate_limit,
+      parseInt(process.env.SEMANTIC_SEARCH_CANDIDATE_LIMIT || '120000', 10),
+      1000,
+      500000
+    ));
+
+    const [tcCols, tcnCols, lmCols] = await Promise.all([
+      getCols('taxonomy_clusters'),
+      getCols('taxonomy_cluster_names'),
+      getCols('taxonomy_label_cluster_map'),
+    ]);
+
+    const normalizedQuery = normalizeSemanticQueryText(query);
+    const embed = await embedSemanticQuery(normalizedQuery);
+    const labelConfig = await getLabelEmbeddingConfig();
+    if (!labelConfig) {
+      return res.status(501).json({
+        error: 'taxonomy_label_embeddings table or embedding column was not found',
+        query,
+        hint: 'Expected one embedding column such as embedding, label_embedding, embedding_vector, label_vector, vector, or text_embedding.',
+      });
+    }
+
+    const { embeddingCol, fieldCol, rawCol, normCol, isPgVector } = labelConfig;
+    const lmCC = lmCols.has('final_cluster_id') ? 'final_cluster_id' : 'cluster_id';
+    const mapJoin = buildLabelMapJoin({ lmCols });
+    if (!mapJoin) {
+      return res.status(501).json({ error: 'taxonomy_label_cluster_map does not expose raw_label or normalized_label for joining semantic hits.' });
+    }
+
+    const resultTemplate = semanticResultSelectSql(tcCols, tcnCols, lmCols).sql
+      .replace(/\$MIN_SCORE/g, '$MIN_SCORE_PLACEHOLDER')
+      .replace(/\$LIMIT/g, '$LIMIT_PLACEHOLDER');
+
+    let rows = [];
+    let engine = isPgVector ? 'pgvector_label_embeddings' : 'javascript_cosine_label_embeddings';
+    let searchedLabels = 0;
+
+    if (isPgVector) {
+      const vals = [vectorLiteral(embed.embedding)];
+      const cond = [`le.${embeddingCol} IS NOT NULL`];
+      if (fieldFilter && fieldCol) {
+        vals.push(fieldFilter);
+        cond.push(`le.${fieldCol} = $${vals.length}`);
+      }
+      vals.push(labelLimit);
+      const labelLimitParam = `$${vals.length}`;
+
+      vals.push(minScore);
+      const minScoreParam = `$${vals.length}`;
+      vals.push(limit);
+      const limitParam = `$${vals.length}`;
+
+      const sql = `
+        WITH label_hits AS (
+          SELECT
+            ${fieldCol ? `le.${fieldCol}` : `NULL::text`} AS field_name,
+            ${rawCol ? `le.${rawCol}` : `NULL::text`} AS raw_label,
+            ${normCol ? `le.${normCol}` : `NULL::text`} AS normalized_label,
+            (1 - (le.${embeddingCol} <=> $1::vector))::double precision AS similarity
+          FROM taxonomy_label_embeddings le
+          WHERE ${cond.join(' AND ')}
+          ORDER BY le.${embeddingCol} <=> $1::vector
+          LIMIT ${labelLimitParam}
+        ),
+        mapped_hits AS (
+          SELECT
+            COALESCE(lm.field_name, h.field_name) AS field_name,
+            lm.${lmCC},
+            ${lmCols.has('run_id') ? 'lm.run_id' : 'NULL::text AS run_id'},
+            COALESCE(lm.raw_label, h.raw_label) AS raw_label,
+            ${lmCols.has('normalized_label') ? 'COALESCE(lm.normalized_label, h.normalized_label)' : 'h.normalized_label'} AS normalized_label,
+            ${lmCols.has('value_count') ? 'lm.value_count' : '1::bigint AS value_count'},
+            h.similarity
+          FROM label_hits h
+          JOIN taxonomy_label_cluster_map lm ON ${mapJoin}
+        ),
+        ${resultTemplate.replace('$MIN_SCORE_PLACEHOLDER', minScoreParam).replace('$LIMIT_PLACEHOLDER', limitParam)}
+      `;
+      const db = await pool.query(sql, vals);
+      rows = db.rows;
+      searchedLabels = labelLimit;
+    } else {
+      const vals = [];
+      const cond = [`le.${embeddingCol} IS NOT NULL`];
+      if (fieldFilter && fieldCol) {
+        vals.push(fieldFilter);
+        cond.push(`le.${fieldCol} = $${vals.length}`);
+      }
+      vals.push(fallbackCandidateLimit);
+
+      const { rows: candidates } = await pool.query(`
+        SELECT
+          ${fieldCol ? `le.${fieldCol}` : `NULL::text`} AS field_name,
+          ${rawCol ? `le.${rawCol}` : `NULL::text`} AS raw_label,
+          ${normCol ? `le.${normCol}` : `NULL::text`} AS normalized_label,
+          le.${embeddingCol}::text AS embedding
+        FROM taxonomy_label_embeddings le
+        WHERE ${cond.join(' AND ')}
+        LIMIT $${vals.length}
+      `, vals);
+
+      searchedLabels = candidates.length;
+      const topHits = candidates
+        .map(r => ({
+          field_name: r.field_name,
+          raw_label: r.raw_label,
+          normalized_label: r.normalized_label,
+          similarity: cosineSimilarity(embed.embedding, parseEmbedding(r.embedding)),
+        }))
+        .filter(r => r.similarity != null)
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, labelLimit);
+
+      if (topHits.length) {
+        const payload = JSON.stringify(topHits);
+        const vals2 = [payload, minScore, limit];
+        const sql = `
+          WITH label_hits AS (
+            SELECT * FROM jsonb_to_recordset($1::jsonb) AS h(
+              field_name text,
+              raw_label text,
+              normalized_label text,
+              similarity double precision
+            )
+          ),
+          mapped_hits AS (
+            SELECT
+              COALESCE(lm.field_name, h.field_name) AS field_name,
+              lm.${lmCC},
+              ${lmCols.has('run_id') ? 'lm.run_id' : 'NULL::text AS run_id'},
+              COALESCE(lm.raw_label, h.raw_label) AS raw_label,
+              ${lmCols.has('normalized_label') ? 'COALESCE(lm.normalized_label, h.normalized_label)' : 'h.normalized_label'} AS normalized_label,
+              ${lmCols.has('value_count') ? 'lm.value_count' : '1::bigint AS value_count'},
+              h.similarity
+            FROM label_hits h
+            JOIN taxonomy_label_cluster_map lm ON ${mapJoin}
+          ),
+          ${resultTemplate.replace('$MIN_SCORE_PLACEHOLDER', '$2').replace('$LIMIT_PLACEHOLDER', '$3')}
+        `;
+        const db = await pool.query(sql, vals2);
+        rows = db.rows;
+      }
+    }
+
+    let callSampleMeta = {
+      available: false,
+      latest_mapper_run_id: null,
+      call_id_source: 'taxonomy_call_cluster_outputs.source_record_id',
+    };
+    if (includeCalls) {
+      const enriched = await attachSemanticCallSamples(rows, { mapperRunId, sampleLimit: sampleCallLimit });
+      rows = enriched.rows;
+      callSampleMeta = enriched.meta;
+    }
+
+    res.json({
+      query,
+      normalized_query: normalizedQuery,
+      field_name: fieldFilter || null,
+      engine,
+      model: embed.model,
+      dimension: embed.dimension,
+      searched_label_candidates: searchedLabels,
+      result_count: rows.length,
+      include_calls: includeCalls,
+      call_id_available: !!callSampleMeta.available,
+      latest_mapper_run_id: callSampleMeta.latest_mapper_run_id,
+      call_id_source: callSampleMeta.call_id_source,
+      results: rows.map(r => ({
+        ...r,
+        semantic_score: r.semantic_score == null ? null : Number(r.semantic_score),
+        best_label_similarity: r.best_label_similarity == null ? null : Number(Number(r.best_label_similarity).toFixed(4)),
+        avg_label_similarity: r.avg_label_similarity == null ? null : Number(Number(r.avg_label_similarity).toFixed(4)),
+        semantic_distinct_calls: r.semantic_distinct_calls == null ? null : Number(r.semantic_distinct_calls),
+        semantic_production_rows: r.semantic_production_rows == null ? null : Number(r.semantic_production_rows),
+        sample_call_ids: Array.isArray(r.sample_call_ids) ? r.sample_call_ids : [],
+        latest_mapper_run_id: r.latest_mapper_run_id || callSampleMeta.latest_mapper_run_id || null,
+        call_id_source: r.call_id_source || callSampleMeta.call_id_source || null,
+        semantic_matched_labels: Array.isArray(r.semantic_matched_labels) ? r.semantic_matched_labels : [],
+      })),
+    });
+  } catch (err) {
+    console.error('/api/semantic-search:', err.message);
+    res.status(500).json({
+      error: err.message,
+      hint: 'Semantic search requires Python sentence-transformers and a taxonomy_label_embeddings table generated with the same embedding model as the query encoder.',
+    });
+  }
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────

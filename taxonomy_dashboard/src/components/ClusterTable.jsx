@@ -10,6 +10,9 @@ const OVERSCAN = 8
 const COLUMNS = [
   { key: 'field_name',              label: 'Field',       sortable: true,  width: 126 },
   { key: 'display_name',            label: 'Name',        sortable: true,  width: 230 },
+  { key: 'semantic_search_score',   label: 'Score',       sortable: true,  width: 76,  align: 'right' },
+  { key: 'semantic_best_label',     label: 'Semantic Match', sortable: false, width: 190 },
+  { key: 'semantic_distinct_calls', label: 'Calls',       sortable: true,  width: 72,  align: 'right' },
   { key: 'cluster_size',            label: 'Size',        sortable: true,  width: 78,  align: 'right' },
   { key: 'total_occurrences',       label: 'Occ.',        sortable: true,  width: 86,  align: 'right' },
   { key: 'label_count',             label: 'Labels',      sortable: true,  width: 76,  align: 'right' },
@@ -63,6 +66,11 @@ function columnClass(col, idx, extra = '') {
 
 function getClusterName(row) {
   return row.display_name || row.medoid_label || row.representative_label || row.cluster_id || 'unnamed'
+}
+
+function semanticScore(row) {
+  const score = Number(row.semantic_search_score)
+  return Number.isFinite(score) ? `${Math.round(score * 100)}%` : '—'
 }
 
 function VirtualBody({ rows, onRowClick, selectedId }) {
@@ -126,6 +134,11 @@ function VirtualBody({ rows, onRowClick, selectedId }) {
                 >
                   {row.display_name ? clusterName : <span className="unnamed">{clusterName}</span>}
                 </td>
+                <td className="cell-num" title={row.semantic_search_score ? String(row.semantic_search_score) : ''}>{semanticScore(row)}</td>
+                <td className="cell-medoid" title={row.semantic_best_label || ''}>
+                  {row.semantic_best_label || '—'}
+                </td>
+                <td className="cell-num" title={Array.isArray(row.sample_call_ids) && row.sample_call_ids.length ? `Sample call IDs: ${row.sample_call_ids.join(', ')}` : ''}>{fmt(row.semantic_distinct_calls)}</td>
                 <td className="cell-num">{fmt(row.cluster_size)}</td>
                 <td className="cell-num">{fmt(row.total_occurrences)}</td>
                 <td className="cell-num">{fmt(row.label_count)}</td>
