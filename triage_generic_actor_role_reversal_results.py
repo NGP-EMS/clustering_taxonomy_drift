@@ -80,8 +80,27 @@ KNOWN_REVIEW_CLUSTERS = {
 
 KNOWN_FALSE_POSITIVE_CLUSTERS = {
     ("additional_tags", "strict_594"): "LIKELY_FALSE_POSITIVE",
-}
 
+    # Reviewed no-fix wording/parser artifacts
+    ("additional_tags", "base_2821"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_reported_agent_misconduct"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_frustrated_by_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_challenged_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_awaiting_specific_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+
+    # Reviewed broker manual clusters
+    ("additional_tags", "manual_customer_confused_by_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_hostile_to_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_burnt_or_conn_by_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_frustrated_by_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_claimed_existing_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_broker_query_on_behalf_of_customer"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_refused_broker_contact"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_broker_fatigue"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_threatened_broker_action"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_broker_threatened_customer"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+    ("additional_tags", "manual_customer_mentioned_existing_broker"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
+}
 
 def normalize(value):
     if pd.isna(value):
