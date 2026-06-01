@@ -79,16 +79,6 @@ KNOWN_REVIEW_CLUSTERS = {
 }
 
 KNOWN_FALSE_POSITIVE_CLUSTERS = {
-    ("additional_tags", "manual_agent_claimed_previous_contact"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_agent_confused_by_customer"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_agent_contact_confirmation"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_agent_manager_feedback"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_agent_role_misrepresentation"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_call_audio_hearing_issue"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_customer_agent_identity_mismatch"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_customer_confused_by_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_landlord_agent_contact_issue"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_customer_recent_colleague_contact"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
     ("additional_tags", "strict_594"): "LIKELY_FALSE_POSITIVE",
 
     # Reviewed no-fix wording/parser artifacts
@@ -99,8 +89,6 @@ KNOWN_FALSE_POSITIVE_CLUSTERS = {
     ("additional_tags", "manual_customer_awaiting_specific_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
 
     # Reviewed broker manual clusters
-    ("additional_tags", "manual_agent_claimed_previous_dm_engagement"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
-    ("additional_tags", "manual_customer_awaiting_internal_colleague"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
     ("additional_tags", "manual_agent_call_termination"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
     ("additional_tags", "manual_customer_hostile_to_agent"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
     ("additional_tags", "strict_38"): "LIKELY_FALSE_POSITIVE_OR_STATUS_SYMMETRY",
