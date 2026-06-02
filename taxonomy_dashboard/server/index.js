@@ -2413,6 +2413,106 @@ app.get('/api/semantic-search', async (req, res) => {
   }
 });
 
+// ── Call Evidence ─────────────────────────────────────────────────────────────
+const callsPool = require('./callsDb');
+
+// Taxonomy field_name → column type in ngp_call_classification.
+// Array fields use $1 = ANY(col) structural matching (no LIKE).
+// Fields marked indexed:false have no GIN index — queries will seq-scan and may timeout;
+// TODO: replace with taxonomy_call_label_index once backfill is ready.
+const TAXONOMY_FIELD_MAP = {
+  call_type:            { type: 'scalar' }, // btree indexed
+  call_type_base:       { type: 'scalar' }, // btree indexed
+  outcome:              { type: 'scalar' }, // btree indexed
+  outcome_base:         { type: 'scalar' }, // btree indexed
+  main_reason:          { type: 'scalar' },
+  additional_tags:      { type: 'array',  indexed: true  }, // GIN indexed (sequence=1)
+  call_type_sub:        { type: 'array',  indexed: false }, // TODO: needs GIN index
+  outcome_sub:          { type: 'array',  indexed: false }, // TODO: needs GIN index
+  tags:                 { type: 'array',  indexed: false }, // TODO: needs GIN index
+  main_reason_sub:      { type: 'array',  indexed: false }, // TODO: needs GIN index
+  next_step:            { type: 'array',  indexed: false }, // TODO: needs GIN index
+  descriptive_keywords: { type: 'array',  indexed: false }, // TODO: needs GIN index
+  coaching_tags:        { type: 'array',  indexed: false }, // TODO: needs GIN index
+  rate_type:            { type: 'array',  indexed: false }, // TODO: needs GIN index
+};
+
+app.get('/api/calls/by-label', async (req, res) => {
+  const fieldName = (req.query.field_name || '').trim();
+  const rawLabel  = (req.query.raw_label  || req.query.label || '').trim();
+  const limit     = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+
+  if (!fieldName || !rawLabel) {
+    return res.status(400).json({ error: 'field_name and raw_label are required' });
+  }
+
+  const colDef = TAXONOMY_FIELD_MAP[fieldName];
+  if (!colDef) {
+    return res.status(400).json({
+      error: `Unknown taxonomy field: "${fieldName}". Supported: ${Object.keys(TAXONOMY_FIELD_MAP).join(', ')}`,
+    });
+  }
+
+  let client;
+  try {
+    client = await callsPool.connect();
+    // Per-query timeout — prevents dashboard hang on unindexed array fields
+    await client.query("SET LOCAL statement_timeout = '8000'");
+
+    const whereExpr = colDef.type === 'array'
+      ? `$1 = ANY(nc."${fieldName}")`
+      : `nc."${fieldName}" = $1`;
+
+    const { rows } = await client.query(
+      `SELECT
+         nc.call_id,
+         nc.call_date_time,
+         nc.created_at,
+         nc.agent_name,
+         nc.call_summary,
+         SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
+         (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
+       FROM ngp_call_classification nc
+       LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
+       WHERE ${whereExpr}
+         AND nc.sequence = 1
+       ORDER BY nc.call_date_time DESC
+       LIMIT $2`,
+      [rawLabel, limit]
+    );
+
+    return res.json({
+      field_name:     fieldName,
+      searched_label: rawLabel,
+      limit,
+      calls: rows.map(r => ({
+        call_id:                   r.call_id,
+        call_date:                 r.call_date_time,
+        created_at:                r.created_at,
+        agent_name:                r.agent_name || null,
+        matched_label:             rawLabel,
+        summary:                   r.call_summary || null,
+        transcript_preview:        r.transcript_preview || null,
+        full_transcript_available: !!r.full_transcript_available,
+      })),
+      has_more: rows.length === limit,
+    });
+  } catch (err) {
+    // PostgreSQL error code 57014 = query_canceled (statement timeout)
+    if (err.code === '57014') {
+      return res.status(504).json({
+        error: 'Call lookup timed out. This field does not have a GIN index and the result set is too large for direct lookup. Use the taxonomy_call_label_index backfill approach.',
+        timeout: true,
+        field_name: fieldName,
+      });
+    }
+    console.error('/api/calls/by-label:', err.message);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.SERVER_PORT || '5050', 10);
 app.listen(PORT, () => console.log(`Taxonomy API → http://localhost:${PORT}`));

@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import { X, Copy, CheckCheck } from 'lucide-react'
 import useStore from '../../store/useStore.js'
 import { getFieldColor } from '../scene/sceneUtils.js'
+import CallEvidence from '../CallEvidence.jsx'
 
 function useCopy(text, ms = 1500) {
   const [copied, setCopied] = useState(false)
@@ -211,7 +212,7 @@ function Section({ title, children }) {
   )
 }
 
-function LabelDistribution({ rows, fc, limit = 28 }) {
+function LabelDistribution({ rows, fc, limit = 28, fieldName = '' }) {
   const sorted = [...rows].sort((a, b) => safeLabelCount(b) - safeLabelCount(a))
   const visible = sorted.slice(0, limit)
   const hidden = Math.max(0, sorted.length - visible.length)
@@ -231,21 +232,29 @@ function LabelDistribution({ rows, fc, limit = 28 }) {
       <div className="flex flex-col gap-2">
         {visible.map((row, i) => {
           const label = labelText(row)
+          const rawLabel = renderSafeValue(row.raw_label || row.label || label)
           const normalized = renderSafeValue(row.normalized_label || '')
           const count = safeLabelCount(row)
           const share = count && maxCount ? count / maxCount : 0
           const similarity = row?.similarity_to_centroid ?? row?.similarity ?? row?.cosine_similarity
           return (
-            <div key={`${label}-${i}`} className="grid grid-cols-[64px_1fr_42px] items-start gap-2">
-              <div className="h-2 rounded-full overflow-hidden mt-1" style={{ background: 'rgba(255,255,255,0.055)' }}>
-                <div className="h-full rounded-full" style={{ width: `${Math.max(6, share * 100)}%`, background: fc, opacity: 0.72 }} />
+            <div key={`${label}-${i}`} className="flex flex-col gap-1">
+              <div className="grid grid-cols-[64px_1fr_42px] items-start gap-2">
+                <div className="h-2 rounded-full overflow-hidden mt-1" style={{ background: 'rgba(255,255,255,0.055)' }}>
+                  <div className="h-full rounded-full" style={{ width: `${Math.max(6, share * 100)}%`, background: fc, opacity: 0.72 }} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[10.5px]" style={{ color: '#94a3b8', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{label}</div>
+                  {normalized && normalized !== label && <div className="text-[8.5px]" style={{ color: '#475569', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{normalized}</div>}
+                  {similarity != null && <div className="text-[8.5px] font-mono" style={{ color: '#64748b' }}>sim {Number(similarity).toFixed(3)}</div>}
+                </div>
+                <div className="text-[10px] text-right font-mono" style={{ color: '#94a3b8' }}>{count ? formatNumber(count) : '—'}</div>
               </div>
-              <div className="min-w-0">
-                <div className="text-[10.5px]" style={{ color: '#94a3b8', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{label}</div>
-                {normalized && normalized !== label && <div className="text-[8.5px]" style={{ color: '#475569', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{normalized}</div>}
-                {similarity != null && <div className="text-[8.5px] font-mono" style={{ color: '#64748b' }}>sim {Number(similarity).toFixed(3)}</div>}
-              </div>
-              <div className="text-[10px] text-right font-mono" style={{ color: '#94a3b8' }}>{count ? formatNumber(count) : '—'}</div>
+              {fieldName && rawLabel && (
+                <div style={{ paddingLeft: 72 }}>
+                  <CallEvidence fieldName={fieldName} rawLabel={rawLabel} />
+                </div>
+              )}
             </div>
           )
         })}
@@ -566,7 +575,7 @@ export default function RightInspector({ clusterId, semanticMatchedLabels = [], 
           {tab === 'members' && (
             <>
               <Section title={`Members · ${formatNumber(tableLabels.length)} loaded`}>
-                <LabelDistribution rows={tableLabels} fc={fc} limit={showAllLabels ? 500 : 60} />
+                <LabelDistribution rows={tableLabels} fc={fc} limit={showAllLabels ? 500 : 60} fieldName={cluster?.field_name || parsedField} />
                 {!showAllLabels && (
                   <button onClick={() => setShowAllLabels(true)} className="mt-4 w-full rounded-lg py-2 text-[11px] text-star transition-colors" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(71,85,105,0.45)' }}>
                     Load More Labels
@@ -585,12 +594,15 @@ export default function RightInspector({ clusterId, semanticMatchedLabels = [], 
                 const weak      = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) < 0.60)
                 const hasWeak   = possible.length > 0 || weak.length > 0
 
+                const clusterFieldName = cluster?.field_name || parsedField
+
                 function MatchCard({ match }) {
                   const rawLabel = renderSafeValue(match?.raw_label || match?.label || match?.normalized_label || match)
                   const normalizedLabel = renderSafeValue(match?.normalized_label || '')
                   const score = labelScore(match)
                   const count = Number(match?.value_count ?? match?.count ?? 0) || 0
                   const band = confBand(score)
+                  const matchField = match?.field_name || clusterFieldName
                   return (
                     <div className="rounded-md px-3 py-2.5" style={{ background: band.bg, border: `1px solid ${band.border}` }}>
                       <div className="flex items-start justify-between gap-2 mb-1">
@@ -606,8 +618,9 @@ export default function RightInspector({ clusterId, semanticMatchedLabels = [], 
                         <div className="text-[8.5px] mb-1" style={{ color: '#475569', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{normalizedLabel}</div>
                       )}
                       {count > 0 && (
-                        <div className="text-[8.5px] font-mono" style={{ color: '#64748b' }}>{count.toLocaleString()} occurrences</div>
+                        <div className="text-[8.5px] font-mono mb-1" style={{ color: '#64748b' }}>{count.toLocaleString()} occurrences</div>
                       )}
+                      {matchField && rawLabel && <CallEvidence fieldName={matchField} rawLabel={rawLabel} />}
                     </div>
                   )
                 }
