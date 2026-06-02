@@ -5,11 +5,27 @@ import RightInspector from '../components/layout/RightInspector.jsx'
 import ClusterTable from '../components/ClusterTable.jsx'
 import { getFieldColor } from '../components/scene/sceneUtils.js'
 import { fetchJson } from '../utils/api.js'
+import { makeClusterKey } from '../utils/clusterKey.js'
 
 const SemanticScene = lazy(() => import('../components/scene/SemanticScene.jsx'))
 
 const OBSERVATORY_FIELD_LIMIT = 8000
 const OBSERVATORY_GLOBAL_LIMIT = 8000
+const SEMANTIC_MIN_SCORE = 0.30
+
+function safeQueryStr(q) {
+  if (!q) return ''
+  if (typeof q === 'string') return q
+  if (typeof q === 'object') return q.normalized_query || q.query || q.text || q.label || JSON.stringify(q)
+  return String(q)
+}
+
+function confBand(score) {
+  const s = Number(score) || 0
+  if (s >= 0.75) return { label: 'confident', color: '#10b981', bg: 'rgba(16,185,129,0.12)', border: 'rgba(16,185,129,0.32)' }
+  if (s >= 0.60) return { label: 'possible',  color: '#f59e0b', bg: 'rgba(245,158,11,0.12)',  border: 'rgba(245,158,11,0.32)'  }
+  return              { label: 'weak',       color: '#64748b', bg: 'rgba(100,116,139,0.10)', border: 'rgba(100,116,139,0.22)' }
+}
 
 // ── Mini sparkline ─────────────────────────────────────────────────────────────
 function Sparkline({ seed = 2.1, color = '#00d4ff', width = 78, height = 30 }) {
@@ -187,11 +203,12 @@ function SceneLoader({ label = 'Initializing…' }) {
 }
 
 
-function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear }) {
+function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear, semanticClusters = [] }) {
   const active = searchState?.active
   const loading = searchState?.loading
   const results = searchState?.results || []
-  const top = results.slice(0, 4)
+  // Prefer enriched clusters (have _clusterKey and full composite identity) over raw API results
+  const top = (active && semanticClusters.length ? semanticClusters : results).slice(0, 4)
   const scoped = selectedFields?.length === 1 ? selectedFields[0] : null
 
   return (
@@ -236,30 +253,29 @@ function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onS
         {active && !searchState?.error && (
           <div className="rounded-lg px-2 py-2 flex flex-col gap-1.5"
             style={{ background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.24)' }}>
-            <div className="flex items-center justify-between">
-              <span className="text-[9px] font-semibold" style={{ color: '#c084fc' }}>{results.length.toLocaleString()} semantic matches</span>
-              <span className="text-[8px] font-mono" style={{ color: '#7e22ce' }}>{searchState.engine || 'embedding'}</span>
-            </div>
-            <div className="text-[8.5px] leading-snug" style={{ color: '#64748b' }}>
-              Showing clusters ranked by matched label embeddings for “{searchState.query}”.
+            <div className="text-[9px] font-semibold" style={{ color: '#c084fc' }}>
+              {results.length.toLocaleString()} cluster{results.length !== 1 ? 's' : ''} matched
             </div>
             {top.length > 0 && (
-              <div className="flex flex-col gap-1 pt-1">
+              <div className="flex flex-col gap-1">
                 {top.map(r => {
                   const fc = getFieldColor(r.field_name)
+                  const score = r.semantic_best_score ?? r.semantic_search_score ?? 0
+                  const band = confBand(score)
                   return (
-                    <button key={`${r.field_name}:${r.cluster_id}`} onClick={() => r.id && window.dispatchEvent(new CustomEvent('semantic-search-select', { detail: { id: r.id } }))}
+                    <button key={r._clusterKey || `${r.field_name}:${r.cluster_id}`}
+                      onClick={() => { const key = r._clusterKey || makeClusterKey(r); if (key) window.dispatchEvent(new CustomEvent('semantic-search-select', { detail: { id: key } })) }}
                       className="text-left rounded-md px-2 py-1.5"
                       style={{ background: 'rgba(3,8,15,0.55)', border: `1px solid ${fc}22` }}>
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[9.5px] truncate" style={{ color: '#cbd5e1' }}>{r.display_name || r.medoid_label || r.cluster_id}</span>
-                        <span className="text-[8.5px] font-mono" style={{ color: '#c084fc' }}>{Math.round((r.semantic_score || 0) * 100)}%</span>
-                      </div>
-                      <div className="text-[8px] truncate" style={{ color: '#64748b' }}>{r.semantic_best_label || 'matched label unavailable'}</div>
-                      {Array.isArray(r.sample_call_ids) && r.sample_call_ids.length > 0 && (
-                        <div className="text-[7.5px] truncate font-mono" style={{ color: '#475569' }} title={r.sample_call_ids.join(', ')}>
-                          calls: {r.sample_call_ids.slice(0, 3).join(', ')}{r.sample_call_ids.length > 3 ? '…' : ''}
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          <span className="text-[8px] px-1 py-0.5 rounded font-medium" style={{ color: band.color, background: band.bg, border: `1px solid ${band.border}` }}>{band.label}</span>
+                          <span className="text-[8.5px] font-mono" style={{ color: band.color }}>{Math.round(score * 100)}%</span>
                         </div>
+                      </div>
+                      {r.semantic_best_label && (
+                        <div className="text-[8px] truncate mt-0.5" style={{ color: '#64748b' }}>{r.semantic_best_label}</div>
                       )}
                     </button>
                   )
@@ -328,7 +344,7 @@ export default function Observatory() {
     setSemanticSearch(prev => ({ ...prev, active: true, query: q, loading: true, error: null, results: [] }))
 
     try {
-      const params = new URLSearchParams({ q, limit: '120', min_score: '0.30', label_limit: '1200' })
+      const params = new URLSearchParams({ q, limit: '120', min_score: String(SEMANTIC_MIN_SCORE), label_limit: '1200' })
       if (selectedFields.length === 1) params.set('field_name', selectedFields[0])
       params.set('include_calls', 'true')
       params.set('sample_call_limit', '8')
@@ -376,7 +392,7 @@ export default function Observatory() {
 
       if (fieldList.length === 0) {
         return fetch(`/api/clusters?limit=${OBSERVATORY_GLOBAL_LIMIT}&projection=umap`).then(r => r.json()).then(data => {
-          if (Array.isArray(data)) setClusters(data)
+          if (Array.isArray(data)) setClusters(data.map(c => ({ ...c, _clusterKey: makeClusterKey(c) })))
         })
       }
 
@@ -391,8 +407,9 @@ export default function Observatory() {
           const field = fieldList[idx], data = r.value
           stats[field] = { rendered: data.length, capped: data.length >= OBSERVATORY_FIELD_LIMIT }
           data.forEach(c => {
-            const key = c.id ?? c.cluster_id
-            if (!seen.has(key)) { seen.add(key); merged.push(c) }
+            // Use composite key (field::version::cluster_id) to avoid cross-field collisions
+            const key = makeClusterKey(c)
+            if (!seen.has(key)) { seen.add(key); merged.push({ ...c, _clusterKey: key }) }
           })
         })
         setClusters(merged)
@@ -430,7 +447,8 @@ export default function Observatory() {
     const map = new Map()
     for (const r of semanticSearch?.results || []) {
       if (!r?.field_name || !r?.cluster_id) continue
-      map.set(`${r.field_name}:${r.cluster_id}`, r)
+      // Use field::cluster_id (no version) since semantic API results may omit cluster_version
+      map.set(`${r.field_name}::${r.cluster_id}`, r)
     }
     return map
   }, [semanticSearch])
@@ -439,11 +457,12 @@ export default function Observatory() {
     if (!semanticSearch?.active || !semanticResultMap.size) return clustersWithProduction
     return clustersWithProduction
       .map(c => {
-        const hit = semanticResultMap.get(`${c.field_name}:${c.cluster_id}`)
+        const hit = semanticResultMap.get(`${c.field_name}::${c.cluster_id}`)
         if (!hit) return null
         return {
           ...c,
           semantic_search_score: hit.semantic_score,
+          semantic_best_score: hit.best_label_similarity,
           semantic_best_label: hit.semantic_best_label,
           semantic_matched_labels: hit.semantic_matched_labels || [],
           semantic_match_count: hit.matched_label_count,
@@ -455,6 +474,20 @@ export default function Observatory() {
       })
       .filter(Boolean)
   }, [clustersWithProduction, semanticSearch, semanticResultMap])
+
+  // Find the exact selected cluster by composite key so the inspector and semantic data are always correct
+  const selectedCluster = useMemo(() => {
+    if (!selectedClusterId) return null
+    return clustersWithSemantic.find(c => c._clusterKey === selectedClusterId) || null
+  }, [selectedClusterId, clustersWithSemantic])
+
+  // Top semantic result clusters (enriched, sorted by score) for the left panel
+  const semanticTopClusters = useMemo(() => {
+    if (!semanticSearch?.active) return []
+    return [...clustersWithSemantic]
+      .sort((a, b) => (b.semantic_search_score || 0) - (a.semantic_search_score || 0))
+      .slice(0, 4)
+  }, [clustersWithSemantic, semanticSearch?.active])
 
   const displayClusters = clustersWithSemantic.filter(c => {
     if (selectedFields.length && !selectedFields.includes(c.field_name)) return false
@@ -601,6 +634,7 @@ export default function Observatory() {
             selectedFields={selectedFields}
             onSearch={runSemanticSearch}
             onClear={clearSemanticSearch}
+            semanticClusters={semanticTopClusters}
           />
 
           {/* Production overlay */}
@@ -745,7 +779,11 @@ export default function Observatory() {
             borderLeft: '1px solid rgba(26,45,74,0.75)',
           }}>
           {selectedClusterId
-            ? <div className="h-full overflow-hidden"><RightInspector clusterId={selectedClusterId} /></div>
+            ? <div className="h-full overflow-hidden"><RightInspector
+                clusterId={selectedClusterId}
+                semanticMatchedLabels={selectedCluster?.semantic_matched_labels || []}
+                semanticQuery={semanticSearch.active ? semanticSearch.query : null}
+              /></div>
             : <DefaultInspector
                 health={health}
                 clusters={displayClusters}

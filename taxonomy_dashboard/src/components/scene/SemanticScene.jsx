@@ -1,6 +1,7 @@
 import { useRef, useEffect, useMemo, useCallback } from 'react'
 import useStore from '../../store/useStore.js'
 import { buildSpatialLayout, seededRand } from './sceneUtils.js'
+import { makeClusterKey } from '../../utils/clusterKey.js'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BG2D = '#080e1a'
@@ -173,8 +174,9 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
   for (const c of cls) {
     const r = Math.min((c._size || 0.5) * sc, 28)
     if (r < 7.5 || (c._sizeRatio || 0) < 0.86) continue
-    const isSel = selId !== null && selId === String(c.id)
-    const isHov = hovId !== null && hovId === String(c.id)
+    const cKey = c._clusterKey || makeClusterKey(c)
+    const isSel = selId !== null && selId === cKey
+    const isHov = hovId !== null && hovId === cKey
     if (isSel || isHov) continue
     const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
     if (px + r * 3 < 0 || px - r * 3 > w || py + r * 3 < 0 || py - r * 3 > h) continue
@@ -196,8 +198,9 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
   // of standard clusters, especially additional_tags.
   const paintClusters = cls.length > 1000 ? [...cls].sort(standardClustersOnTop) : cls
   for (const c of paintClusters) {
-    const isSel = selId !== null && selId === String(c.id)
-    const isHov = hovId !== null && hovId === String(c.id)
+    const cKey = c._clusterKey || makeClusterKey(c)
+    const isSel = selId !== null && selId === cKey
+    const isHov = hovId !== null && hovId === cKey
     if (isSel || isHov) { focusC = c; continue }
     const rawR = Math.max((c._size || 0.5) * sc, 0.75)
     const r = Math.min(rawR, cls.length > 1200 ? 7.5 : 11)
@@ -225,7 +228,8 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
   // Neighbor lines for focus
   if (focusC) {
     const [fx, fy] = focusC._pos
-    const sorted = [...cls].filter(c => String(c.id) !== String(focusC.id))
+    const focusKey = focusC._clusterKey || makeClusterKey(focusC)
+    const sorted = [...cls].filter(c => (c._clusterKey || makeClusterKey(c)) !== focusKey)
       .map(c => { const dx = c._pos[0] - fx, dy = c._pos[1] - fy; return { c, d2: dx * dx + dy * dy } })
       .sort((a, b) => a.d2 - b.d2).slice(0, 6)
     const [fpx, fpy] = w2c(fx, fy, w, h, tx, ty, sc)
@@ -239,7 +243,7 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
 
   // Focus cluster (selected / hovered) on top
   if (focusC) {
-    const isSel = selId !== null && selId === String(focusC.id)
+    const isSel = selId !== null && selId === (focusC._clusterKey || makeClusterKey(focusC))
     const rawFocusR = Math.max((focusC._size || 0.5) * sc * (isSel ? 1.7 : 1.35), 1.5)
     const r = Math.min(rawFocusR, isSel ? 16 : 13)
     const [px, py] = w2c(focusC._pos[0], focusC._pos[1], w, h, tx, ty, sc)
@@ -302,12 +306,13 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     // filtered cluster label. Auto-label mode is still gated so the map stays
     // readable when labels are OFF.
     const labCls = showL
-      ? cls.filter(c => String(c.id) !== selId && String(c.id) !== hovId)
+      ? cls.filter(c => { const k = c._clusterKey || makeClusterKey(c); return k !== selId && k !== hovId })
       : cls
           .filter(c => {
             const ratio = c._sizeRatio || 0
             const threshold = sc > 24 ? 0.28 : sc > 14 ? 0.48 : 0.70
-            return ratio >= threshold && String(c.id) !== selId && String(c.id) !== hovId
+            const k = c._clusterKey || makeClusterKey(c)
+            return ratio >= threshold && k !== selId && k !== hovId
           })
           .sort((a, b) => (b._sizeRatio || 0) - (a._sizeRatio || 0))
           .slice(0, sc > 24 ? 34 : sc > 14 ? 18 : 8)
@@ -368,8 +373,9 @@ function draw3D(ctx, cls, w, h, rotX, rotY, fov, zoom, panX, panY, selId, hovId,
   const items = cls.map(c => {
     const [ox, oy, oz] = c._pos
     const { sx, sy, z, s } = project3D(ox, oy, oz, rotX, rotY, fov, zoom)
-    const isSel = selId !== null && selId === String(c.id)
-    const isHov = hovId !== null && hovId === String(c.id)
+    const cKey = c._clusterKey || makeClusterKey(c)
+    const isSel = selId !== null && selId === cKey
+    const isHov = hovId !== null && hovId === cKey
     const rawBaseR = Math.max((c._size || 0.5) * s * 0.9, 0.5)
     const baseR = Math.min(rawBaseR, cls.length > 1200 ? 7 : 10)
     const r = baseR * (isSel ? 1.6 : isHov ? 1.25 : 1.0)
@@ -790,13 +796,13 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
     if (is3dRef.current) {
       const { rotX, rotY, fov, zoom, panX, panY, w, h } = xf3d.current
       const hit = nearest3D(posRef.current, e.clientX - rect.left, e.clientY - rect.top, w, h, rotX, rotY, fov, zoom, panX, panY)
-      setHoveredClusterId(hit ? hit.id : null)
+      setHoveredClusterId(hit ? (hit._clusterKey || makeClusterKey(hit)) : null)
       return
     }
     const { tx, ty, sc, w, h } = xf2d.current
     const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
     const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
-    setHoveredClusterId(hit ? hit.id : null)
+    setHoveredClusterId(hit ? (hit._clusterKey || makeClusterKey(hit)) : null)
   }
 
   function onMouseUp(e) {
@@ -810,14 +816,14 @@ export default function SemanticScene({ clusters, colorMode, viewMode, showLabel
       if (is3dRef.current) {
         const { rotX, rotY, fov, zoom, panX, panY, w, h } = xf3d.current
         const hit = nearest3D(posRef.current, e.clientX - rect.left, e.clientY - rect.top, w, h, rotX, rotY, fov, zoom, panX, panY)
-        if (hit) setSelectedClusterId(prev => String(prev) === String(hit.id) ? null : hit.id)
+        if (hit) { const k = hit._clusterKey || makeClusterKey(hit); setSelectedClusterId(prev => prev === k ? null : k) }
         else setSelectedClusterId(null)
       } else {
         const { tx, ty, sc, w, h } = xf2d.current
         const [wx, wy] = c2w(e.clientX - rect.left, e.clientY - rect.top, w, h, tx, ty, sc)
         const hit = nearest2D(posRef.current, wx, wy, 18 / sc)
-        if (hit) setSelectedClusterId(prev => String(prev) === String(hit.id) ? null : hit.id)
-        else      setSelectedClusterId(null)
+        if (hit) { const k = hit._clusterKey || makeClusterKey(hit); setSelectedClusterId(prev => prev === k ? null : k) }
+        else setSelectedClusterId(null)
       }
     }
   }

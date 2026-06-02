@@ -16,6 +16,24 @@ function useCopy(text, ms = 1500) {
   return [copied, copy]
 }
 
+function safeQueryStr(q) {
+  if (!q) return ''
+  if (typeof q === 'string') return q
+  if (typeof q === 'object') return q.normalized_query || q.query || q.text || q.label || ''
+  return String(q)
+}
+
+function confBand(score) {
+  const s = Number(score) || 0
+  if (s >= 0.75) return { label: 'Confident', color: '#10b981', bg: 'rgba(16,185,129,0.10)', border: 'rgba(16,185,129,0.28)' }
+  if (s >= 0.60) return { label: 'Possible',  color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  border: 'rgba(245,158,11,0.28)'  }
+  return              { label: 'Weak',       color: '#64748b', bg: 'rgba(100,116,139,0.08)', border: 'rgba(100,116,139,0.20)' }
+}
+
+function labelScore(match) {
+  return match?.similarity_score ?? match?.score ?? match?.semantic_score ?? match?.similarity ?? null
+}
+
 function renderSafeValue(value) {
   if (value == null) return ''
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
@@ -218,13 +236,13 @@ function LabelDistribution({ rows, fc, limit = 28 }) {
           const share = count && maxCount ? count / maxCount : 0
           const similarity = row?.similarity_to_centroid ?? row?.similarity ?? row?.cosine_similarity
           return (
-            <div key={`${label}-${i}`} className="grid grid-cols-[64px_1fr_42px] items-center gap-2">
-              <div className="h-2 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.055)' }}>
+            <div key={`${label}-${i}`} className="grid grid-cols-[64px_1fr_42px] items-start gap-2">
+              <div className="h-2 rounded-full overflow-hidden mt-1" style={{ background: 'rgba(255,255,255,0.055)' }}>
                 <div className="h-full rounded-full" style={{ width: `${Math.max(6, share * 100)}%`, background: fc, opacity: 0.72 }} />
               </div>
               <div className="min-w-0">
-                <div className="text-[10.5px] truncate" style={{ color: '#94a3b8' }}>{label}</div>
-                {normalized && normalized !== label && <div className="text-[8.5px] truncate" style={{ color: '#475569' }}>{normalized}</div>}
+                <div className="text-[10.5px]" style={{ color: '#94a3b8', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{label}</div>
+                {normalized && normalized !== label && <div className="text-[8.5px]" style={{ color: '#475569', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{normalized}</div>}
                 {similarity != null && <div className="text-[8.5px] font-mono" style={{ color: '#64748b' }}>sim {Number(similarity).toFixed(3)}</div>}
               </div>
               <div className="text-[10px] text-right font-mono" style={{ color: '#94a3b8' }}>{count ? formatNumber(count) : '—'}</div>
@@ -263,7 +281,7 @@ function MiniCentroidMedoid({ medoidSimilarity, medoidLabel, fc }) {
   )
 }
 
-export default function RightInspector({ clusterId }) {
+export default function RightInspector({ clusterId, semanticMatchedLabels = [], semanticQuery = null }) {
   const { setSelectedClusterId } = useStore()
   const [cluster, setCluster] = useState(null)
   const [labels, setLabels] = useState([])
@@ -274,6 +292,18 @@ export default function RightInspector({ clusterId }) {
   const [copiedId, copyId] = useCopy(cluster?.cluster_id || cluster?.id)
   const [copiedLabel, copyLabel] = useCopy(cluster?.medoid_label || cluster?.representative_label || cluster?.display_name)
 
+  // Parse composite key (field::version::cluster_id) to extract raw cluster_id and field for API calls
+  let rawClusterId = clusterId
+  let parsedField = ''
+  if (clusterId && typeof clusterId === 'string' && clusterId.includes('::')) {
+    const parts = clusterId.split('::')
+    if (parts.length >= 3) {
+      rawClusterId = parts.slice(2).join('::')
+      parsedField = parts[0] || ''
+    }
+  }
+  const fieldParam = parsedField ? `field_name=${encodeURIComponent(parsedField)}` : ''
+
   useEffect(() => {
     if (!clusterId) return
     setTab('overview')
@@ -281,16 +311,19 @@ export default function RightInspector({ clusterId }) {
   }, [clusterId])
 
   useEffect(() => {
-    if (!clusterId) return
+    if (!rawClusterId) return
     let cancelled = false
     setLoading(true)
     setCluster(null)
     setLabels([])
     setRunMeta(null)
 
+    const clusterUrl = `/api/cluster/${rawClusterId}${fieldParam ? `?${fieldParam}` : ''}`
+    const labelsUrl = `/api/cluster/${rawClusterId}/labels?limit=${showAllLabels ? 500 : 40}${fieldParam ? `&${fieldParam}` : ''}`
+
     Promise.allSettled([
-      fetch(`/api/cluster/${clusterId}`).then(r => r.json()),
-      fetch(`/api/cluster/${clusterId}/labels?limit=${showAllLabels ? 500 : 40}`).then(r => r.json()),
+      fetch(clusterUrl).then(r => r.json()),
+      fetch(labelsUrl).then(r => r.json()),
     ]).then(async ([c, l]) => {
       if (cancelled) return
 
@@ -354,6 +387,7 @@ export default function RightInspector({ clusterId }) {
     })
 
     return () => { cancelled = true }
+  // clusterId (composite key) ensures re-fetch when field changes even if cluster_id stays same
   }, [clusterId, showAllLabels])
 
   const fc = cluster ? getFieldColor(cluster.field_name) : '#00d4ff'
@@ -461,15 +495,19 @@ export default function RightInspector({ clusterId }) {
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-0 text-center border-b border-obs-border/60">
+            <div className="grid grid-cols-4 gap-0 text-center border-b border-obs-border/60">
               {[
                 ['overview', 'Overview'],
                 ['members', 'Members'],
+                ['semantic', 'Matches'],
                 ['quality', 'Quality'],
               ].map(([key, label]) => (
-                <button key={key} onClick={() => setTab(key)} className="relative py-1.5 text-[9.5px] transition-colors" style={{ color: tab === key ? fc : '#94a3b8' }}>
+                <button key={key} onClick={() => setTab(key)} className="relative py-1.5 text-[9px] transition-colors" style={{ color: tab === key ? fc : '#94a3b8' }}>
+                  {key === 'semantic' && semanticQuery && semanticMatchedLabels.length > 0 && (
+                    <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full" style={{ background: '#a855f7', boxShadow: '0 0 4px #a855f7' }} />
+                  )}
                   {label}
-                  {tab === key && <span className="absolute left-2 right-2 bottom-0 h-0.5 rounded-full" style={{ background: fc, boxShadow: `0 0 8px ${fc}` }} />}
+                  {tab === key && <span className="absolute left-1 right-1 bottom-0 h-0.5 rounded-full" style={{ background: fc, boxShadow: `0 0 8px ${fc}` }} />}
                 </button>
               ))}
             </div>
@@ -535,6 +573,83 @@ export default function RightInspector({ clusterId }) {
                   </button>
                 )}
               </Section>
+            </>
+          )}
+
+          {tab === 'semantic' && (
+            <>
+              {(() => {
+                const queryStr = safeQueryStr(semanticQuery)
+                const confident = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) >= 0.75)
+                const possible  = semanticMatchedLabels.filter(m => { const s = Number(labelScore(m)) || 0; return s >= 0.60 && s < 0.75 })
+                const weak      = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) < 0.60)
+                const hasWeak   = possible.length > 0 || weak.length > 0
+
+                function MatchCard({ match }) {
+                  const rawLabel = renderSafeValue(match?.raw_label || match?.label || match?.normalized_label || match)
+                  const normalizedLabel = renderSafeValue(match?.normalized_label || '')
+                  const score = labelScore(match)
+                  const count = Number(match?.value_count ?? match?.count ?? 0) || 0
+                  const band = confBand(score)
+                  return (
+                    <div className="rounded-md px-3 py-2.5" style={{ background: band.bg, border: `1px solid ${band.border}` }}>
+                      <div className="flex items-start justify-between gap-2 mb-1">
+                        <span className="text-[10.5px]" style={{ color: '#cbd5e1', flex: 1, minWidth: 0, wordBreak: 'break-word', overflowWrap: 'anywhere' }}>{rawLabel}</span>
+                        {score != null && (
+                          <div className="flex items-center gap-1 flex-shrink-0 mt-0.5">
+                            <span className="text-[8px] font-medium" style={{ color: band.color }}>{band.label}</span>
+                            <span className="text-[9.5px] font-mono" style={{ color: band.color }}>{Math.round(Number(score) * 100)}%</span>
+                          </div>
+                        )}
+                      </div>
+                      {normalizedLabel && normalizedLabel !== rawLabel && (
+                        <div className="text-[8.5px] mb-1" style={{ color: '#475569', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal' }}>{normalizedLabel}</div>
+                      )}
+                      {count > 0 && (
+                        <div className="text-[8.5px] font-mono" style={{ color: '#64748b' }}>{count.toLocaleString()} occurrences</div>
+                      )}
+                    </div>
+                  )
+                }
+
+                return (
+                  <Section title={queryStr ? `Semantic matches for "${queryStr}"` : 'Semantic Matches'}>
+                    {!queryStr ? (
+                      <div className="text-[11px] leading-relaxed" style={{ color: '#64748b' }}>
+                        No semantic search is active. Run a search from the left panel to see matched labels for this cluster.
+                      </div>
+                    ) : semanticMatchedLabels.length === 0 ? (
+                      <div className="text-[11px] leading-relaxed" style={{ color: '#64748b' }}>
+                        No semantic label matches found for this cluster.
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-3">
+                        {confident.length === 0 ? (
+                          <div className="rounded-md px-3 py-2.5 text-[11px] leading-snug" style={{ color: '#f59e0b', background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.22)' }}>
+                            No confident semantic match found for this cluster.
+                          </div>
+                        ) : (
+                          <div className="flex flex-col gap-2">
+                            <div className="text-[9px] uppercase tracking-wider font-semibold" style={{ color: '#10b981' }}>
+                              Confident ({confident.length})
+                            </div>
+                            {confident.map((m, i) => <MatchCard key={`conf-${i}`} match={m} />)}
+                          </div>
+                        )}
+
+                        {hasWeak && (
+                          <div className="flex flex-col gap-2">
+                            <div className="text-[9px] uppercase tracking-wider font-semibold" style={{ color: '#64748b' }}>
+                              Possible weak matches ({possible.length + weak.length})
+                            </div>
+                            {[...possible, ...weak].map((m, i) => <MatchCard key={`weak-${i}`} match={m} />)}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </Section>
+                )
+              })()}
             </>
           )}
 

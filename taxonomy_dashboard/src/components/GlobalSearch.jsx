@@ -4,6 +4,7 @@ import { Search, X, ArrowRight, AlertTriangle } from 'lucide-react'
 import { useAppCtx } from '../context/AppContext.jsx'
 import { useDebounce } from '../hooks/useDebounce.js'
 import { truncate } from '../utils/format.js'
+import { makeClusterKey } from '../utils/clusterKey.js'
 
 export default function GlobalSearch() {
   const { setSearchOpen, setSelectedClusterId, navigate, fields } = useAppCtx()
@@ -39,7 +40,7 @@ export default function GlobalSearch() {
 
   function selectResult(row) {
     navigate('observatory')
-    setSelectedClusterId(row.id)
+    setSelectedClusterId(makeClusterKey(row) || row.id)
     close()
   }
 

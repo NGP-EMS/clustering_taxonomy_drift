@@ -3,6 +3,7 @@ import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { useAppCtx } from '../context/AppContext.jsx'
 import { fmt } from '../utils/format.js'
 import { getFieldColor } from '../utils/colors.js'
+import { makeClusterKey } from '../utils/clusterKey.js'
 
 const ROW_H   = 40
 const OVERSCAN = 8
@@ -110,11 +111,11 @@ function VirtualBody({ rows, onRowClick, selectedId }) {
             const clusterName = getClusterName(row)
             return (
               <tr
-                key={row.id ?? `${row.field_name}-${row.cluster_id}-${start + idx}`}
+                key={row._clusterKey ?? row.id ?? `${row.field_name}-${row.cluster_id}-${start + idx}`}
                 className={[
                   'vtable-row',
                   row.is_true_anomaly_cluster && 'row-anomaly',
-                  String(selectedId) === String(row.id) && 'row-selected',
+                  selectedId === (row._clusterKey || makeClusterKey(row)) && 'row-selected',
                 ].filter(Boolean).join(' ')}
                 onClick={() => onRowClick(row)}
               >
@@ -183,7 +184,8 @@ export default function ClusterTable({ clusters, loading, error }) {
   }, [])
 
   const handleRowClick = useCallback((row) => {
-    setSelectedClusterId(prev => String(prev) === String(row.id) ? null : row.id)
+    const key = row._clusterKey || makeClusterKey(row)
+    setSelectedClusterId(prev => prev === key ? null : key)
   }, [setSelectedClusterId])
 
   if (error)   return <div className="state-error">{error}</div>
