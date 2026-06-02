@@ -49,3 +49,7 @@ dist/
 .env.*
 rude_direction_investigation/
 deep_rude_direction_investigation/
+server/.bge_cache/
+scripts/.bge_cache/
+taxonomy_dashboard/.bge_cache/
+*.pkl

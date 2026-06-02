@@ -97,7 +97,9 @@ export default function CallEvidence({ fieldName, rawLabel }) {
     const params = new URLSearchParams({ field_name: fieldName, raw_label: rawLabel, limit: '25' })
     fetch(`/api/calls/by-label?${params}`)
       .then(r => {
-        if (!r.ok && r.status === 404) throw new Error('Endpoint not found — restart the taxonomy server to load the new /api/calls/by-label route.')
+        if (r.status === 404) throw new Error('Endpoint not found — restart the taxonomy server to load the /api/calls/by-label route.')
+        if (r.status === 503) return r.json().then(d => { throw new Error(d.error || 'Cannot reach the calls database. Check VPN.') })
+        if (r.status === 422) return r.json().then(d => { throw new Error(d.error || 'This field needs a GIN index.') })
         const ct = r.headers.get('content-type') || ''
         if (!ct.includes('application/json')) throw new Error(`Server returned unexpected response (${r.status}). Ensure the taxonomy server is running with the latest code.`)
         return r.json()
@@ -153,8 +155,12 @@ export default function CallEvidence({ fieldName, rawLabel }) {
               wordBreak: 'break-word',
             }}>
               {error.includes('timed out') || error.includes('timeout')
-                ? 'Call lookup timed out. This field needs an indexed lookup — add taxonomy_call_label_index backfill to support it.'
-                : error}
+                ? 'Call lookup timed out. This field needs a GIN index on the calls database.'
+                : error.includes('GIN index')
+                  ? error
+                  : error.includes('VPN') || error.includes('calls database')
+                    ? 'Cannot reach the calls database. Check that VPN is connected, then restart the server.'
+                    : error}
             </div>
           )}
           {!loading && !error && data && !Array.isArray(data.calls) && (

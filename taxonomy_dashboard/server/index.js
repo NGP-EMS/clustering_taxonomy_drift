@@ -226,6 +226,133 @@ semanticEmbeddingWorker.start().catch(err => {
   console.warn('[semantic-embed-worker] preload failed:', err.message);
 });
 
+// ── BGE-M3 + Voyage rerank worker ────────────────────────────────────────────
+// Activated via SEMANTIC_SEARCH_PROVIDER=bge_voyage.
+// On startup the worker builds (or loads) a FAISS index of all taxonomy labels.
+// Each search request returns pre-grouped cluster results ranked by Voyage score.
+class BgeVoyageWorker {
+  constructor() {
+    this.child        = null;
+    this.ready        = false;
+    this.readyPromise = null;
+    this.pending      = new Map();
+    this.buffer       = '';
+    this.nextId       = 1;
+    this.lastStart    = 0;
+  }
+
+  start() {
+    if (this.child && !this.child.killed) return this.readyPromise;
+
+    const now = Date.now();
+    if (now - this.lastStart < 1000) {
+      return this.readyPromise || Promise.reject(new Error('BGE/Voyage worker restart throttled'));
+    }
+    this.lastStart = now;
+
+    const pythonExec = process.env.SEMANTIC_SEARCH_PYTHON || process.env.PYTHON || 'python';
+    const scriptPath = path.resolve(__dirname, 'bge_voyage_worker.py');
+    this.ready  = false;
+    this.buffer = '';
+
+    // First run downloads BAAI/bge-m3 (~1.5 GB) and embeds all taxonomy labels.
+    // Allow up to 30 minutes before declaring startup failure.
+    const startupTimeoutMs = parseInt(
+      process.env.BGE_VOYAGE_STARTUP_TIMEOUT_MS || String(30 * 60 * 1000), 10
+    );
+
+    this.child = spawn(pythonExec, ['-u', scriptPath], {
+      cwd:   path.resolve(__dirname, '..'),
+      env:   process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    this.readyPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`BGE/Voyage worker startup timed out after ${startupTimeoutMs}ms`));
+      }, startupTimeoutMs);
+      this._finishReady = payload => { clearTimeout(timer); this.ready = true; resolve(payload); };
+      this._failReady   = err    => { clearTimeout(timer); reject(err); };
+    });
+
+    this.child.stdout.on('data', d => this.handleStdout(d));
+    this.child.stderr.on('data', d => {
+      const msg = d.toString().trim();
+      if (msg) console.warn('[bge-voyage-worker]', msg);
+    });
+    this.child.on('error', err  => this.failAll(err));
+    this.child.on('close', code => {
+      const err = new Error(`BGE/Voyage worker exited with code ${code}`);
+      this.ready = false;
+      this.child = null;
+      if (this._failReady) this._failReady(err);
+      this.failAll(err);
+    });
+
+    return this.readyPromise;
+  }
+
+  handleStdout(chunk) {
+    this.buffer += chunk.toString();
+    let idx;
+    while ((idx = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + 1);
+      if (!line) continue;
+
+      let payload;
+      try { payload = JSON.parse(line); }
+      catch { console.warn('[bge-voyage-worker] non-json stdout:', line.slice(0, 200)); continue; }
+
+      if (payload.type === 'ready') {
+        console.log(
+          `[bge-voyage-worker] ready — model=${payload.model}` +
+          ` dim=${payload.dimension} indexed_docs=${payload.indexed_docs}`
+        );
+        if (this._finishReady) this._finishReady(payload);
+        continue;
+      }
+
+      const id = String(payload.id || '');
+      if (!id || !this.pending.has(id)) continue;
+      const item = this.pending.get(id);
+      this.pending.delete(id);
+      clearTimeout(item.timer);
+      if (payload.error) item.reject(new Error(payload.error));
+      else               item.resolve(payload);
+    }
+  }
+
+  failAll(err) {
+    for (const [, item] of this.pending) { clearTimeout(item.timer); item.reject(err); }
+    this.pending.clear();
+  }
+
+  async search(params) {
+    await this.start();
+    const requestTimeoutMs = parseInt(
+      process.env.BGE_VOYAGE_REQUEST_TIMEOUT_MS || '90000', 10
+    );
+    const id = String(this.nextId++);
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`BGE/Voyage search timed out after ${requestTimeoutMs}ms`));
+      }, requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.child.stdin.write(`${JSON.stringify({ id, ...params })}\n`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+}
+
+const bgeVoyageWorker = new BgeVoyageWorker();
+
 async function getLabelEmbeddingConfig() {
   if (!(await tableExists('taxonomy_label_embeddings'))) return null;
   const cols = await getCols('taxonomy_label_embeddings');
@@ -2228,13 +2355,68 @@ app.get('/api/semantic-search', async (req, res) => {
       500000
     ));
 
+    const normalizedQuery = normalizeSemanticQueryText(query);
+
+    // ── BGE-M3 + Voyage rerank path (SEMANTIC_SEARCH_PROVIDER=bge_voyage) ───────
+    const _provider = (process.env.SEMANTIC_SEARCH_PROVIDER || '').toLowerCase().trim();
+    if (_provider === 'bge_voyage') {
+      const bgeTopK = parseInt(process.env.BGE_TOP_K_RETRIEVE || '200', 10);
+      const bgeResult = await bgeVoyageWorker.search({
+        query:      normalizedQuery,
+        field_name: fieldFilter || '',
+        limit,
+        top_k:      bgeTopK,
+        min_score:  minScore,
+      });
+
+      let bgeRows = Array.isArray(bgeResult.results) ? bgeResult.results : [];
+      let bgeCallMeta = {
+        available:             false,
+        latest_mapper_run_id:  null,
+        call_id_source:        'taxonomy_call_cluster_outputs.source_record_id',
+      };
+      if (includeCalls) {
+        const enriched = await attachSemanticCallSamples(bgeRows,
+          { mapperRunId, sampleLimit: sampleCallLimit });
+        bgeRows     = enriched.rows;
+        bgeCallMeta = enriched.meta;
+      }
+
+      return res.json({
+        query,
+        normalized_query:          normalizedQuery,
+        field_name:                fieldFilter || null,
+        engine:                    bgeResult.engine || 'bge_voyage',
+        model:                     bgeResult.model  || null,
+        dimension:                 bgeResult.dimension || null,
+        searched_label_candidates: bgeResult.searched_label_candidates || bgeTopK,
+        result_count:              bgeRows.length,
+        include_calls:             includeCalls,
+        call_id_available:         !!bgeCallMeta.available,
+        latest_mapper_run_id:      bgeCallMeta.latest_mapper_run_id,
+        call_id_source:            bgeCallMeta.call_id_source,
+        results: bgeRows.map(r => ({
+          ...r,
+          semantic_score:           r.semantic_score           == null ? null : Number(r.semantic_score),
+          best_label_similarity:    r.best_label_similarity    == null ? null : Number(Number(r.best_label_similarity).toFixed(4)),
+          avg_label_similarity:     r.avg_label_similarity     == null ? null : Number(Number(r.avg_label_similarity).toFixed(4)),
+          semantic_distinct_calls:  r.semantic_distinct_calls  == null ? null : Number(r.semantic_distinct_calls),
+          semantic_production_rows: r.semantic_production_rows == null ? null : Number(r.semantic_production_rows),
+          sample_call_ids:          Array.isArray(r.sample_call_ids) ? r.sample_call_ids : [],
+          latest_mapper_run_id:     r.latest_mapper_run_id || bgeCallMeta.latest_mapper_run_id || null,
+          call_id_source:           r.call_id_source || bgeCallMeta.call_id_source || null,
+          semantic_matched_labels:  Array.isArray(r.semantic_matched_labels) ? r.semantic_matched_labels : [],
+        })),
+      });
+    }
+
+    // ── existing MiniLM / pgvector path ─────────────────────────────────────────
     const [tcCols, tcnCols, lmCols] = await Promise.all([
       getCols('taxonomy_clusters'),
       getCols('taxonomy_cluster_names'),
       getCols('taxonomy_label_cluster_map'),
     ]);
 
-    const normalizedQuery = normalizeSemanticQueryText(query);
     const embed = await embedSemanticQuery(normalizedQuery);
     const labelConfig = await getLabelEmbeddingConfig();
     if (!labelConfig) {
@@ -2437,31 +2619,97 @@ const TAXONOMY_FIELD_MAP = {
   rate_type:            { type: 'array',  indexed: false }, // TODO: needs GIN index
 };
 
+// Parse a taxonomy raw_label that may be stored as a PostgreSQL array literal.
+// Returns { values: string[], multi: bool }
+// Examples:
+//   "Customer_Hung_Up"    → { values: ['Customer_Hung_Up'], multi: false }
+//   "{Customer_Hung_Up}"  → { values: ['Customer_Hung_Up'], multi: false }
+//   "{Renewal,Pitch}"     → { values: ['Renewal','Pitch'],   multi: true  }
+function parseCallLabel(label) {
+  if (label.startsWith('{') && label.endsWith('}')) {
+    const inner = label.slice(1, -1);
+    const values = inner.split(',')
+      .map(s => s.trim().replace(/^"(.*)"$/, '$1'))
+      .filter(Boolean);
+    return { values, multi: values.length > 1 };
+  }
+  return { values: [label], multi: false };
+}
+
 app.get('/api/calls/by-label', async (req, res) => {
   const fieldName = (req.query.field_name || '').trim();
   const rawLabel  = (req.query.raw_label  || req.query.label || '').trim();
   const limit     = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+  const t0 = Date.now();
+
+  console.log(`[calls/by-label] → field=${fieldName} label=${JSON.stringify(rawLabel)} limit=${limit}`);
 
   if (!fieldName || !rawLabel) {
+    console.log('[calls/by-label] ✗ missing params');
     return res.status(400).json({ error: 'field_name and raw_label are required' });
   }
 
   const colDef = TAXONOMY_FIELD_MAP[fieldName];
   if (!colDef) {
+    console.log(`[calls/by-label] ✗ unknown field: ${fieldName}`);
     return res.status(400).json({
       error: `Unknown taxonomy field: "${fieldName}". Supported: ${Object.keys(TAXONOMY_FIELD_MAP).join(', ')}`,
     });
   }
 
+  // Parse label — strip PostgreSQL array-literal braces and split multi-value labels
+  const { values: labelValues, multi: isMultiLabel } = parseCallLabel(rawLabel);
+  const searchLabel = labelValues.length === 1 ? labelValues[0] : rawLabel;
+  if (labelValues.join(',') !== rawLabel) {
+    console.log(`[calls/by-label] label parsed: ${JSON.stringify(rawLabel)} → [${labelValues.map(v => JSON.stringify(v)).join(', ')}]`);
+  }
+
+  // Unindexed array fields need a GIN index on the production DB or every
+  // lookup is a full sequential scan of ~4M rows.  Fail fast with instructions
+  // rather than hanging for 8 s before timing out.
+  if (colDef.type === 'array' && colDef.indexed === false) {
+    console.log(`[calls/by-label] ✗ field "${fieldName}" has no GIN index — rejecting to avoid seq-scan`);
+    return res.status(422).json({
+      error: `"${fieldName}" does not have a GIN index on the calls database. Call lookup for this field requires a GIN index to be fast.`,
+      hint: `Run this on the ai-calls-analysis-db to enable it:\nCREATE INDEX CONCURRENTLY idx_ngp_cc_${fieldName} ON ngp_call_classification USING GIN(${fieldName}) WHERE sequence = 1;`,
+      field_name: fieldName,
+      no_index: true,
+    });
+  }
+
+  console.log(`[calls/by-label] field type=${colDef.type} indexed=${colDef.indexed} — connecting to calls DB...`);
+
+  // Build WHERE clause:
+  //   scalar field       → col = $1
+  //   array, single val  → $1 = ANY(col)          ← uses GIN index
+  //   array, multi val   → col @> ARRAY[...]       ← GIN contains, all values must match
+  let whereExpr, queryValues;
+  if (colDef.type === 'array') {
+    if (isMultiLabel) {
+      whereExpr = `nc."${fieldName}" @> $1::text[]`;
+      queryValues = [labelValues, limit];
+    } else {
+      whereExpr = `$1 = ANY(nc."${fieldName}")`;
+      queryValues = [labelValues[0], limit];
+    }
+  } else {
+    whereExpr = `nc."${fieldName}" = $1`;
+    queryValues = [labelValues[0], limit];
+  }
+
+  console.log(`[calls/by-label] WHERE ${isMultiLabel
+    ? `"${fieldName}" @> [${labelValues.map(v => JSON.stringify(v)).join(',')}]`
+    : whereExpr.replace('$1', JSON.stringify(queryValues[0]))}`);
+
   let client;
   try {
     client = await callsPool.connect();
-    // Per-query timeout — prevents dashboard hang on unindexed array fields
-    await client.query("SET LOCAL statement_timeout = '8000'");
+    console.log(`[calls/by-label] connected (${Date.now() - t0}ms) — running query...`);
 
-    const whereExpr = colDef.type === 'array'
-      ? `$1 = ANY(nc."${fieldName}")`
-      : `nc."${fieldName}" = $1`;
+    // SET LOCAL only works inside an explicit transaction; without BEGIN the
+    // timeout silently applies only to the SET statement, not the SELECT.
+    await client.query('BEGIN');
+    await client.query("SET LOCAL statement_timeout = '8000'");
 
     const { rows } = await client.query(
       `SELECT
@@ -2478,19 +2726,24 @@ app.get('/api/calls/by-label', async (req, res) => {
          AND nc.sequence = 1
        ORDER BY nc.call_date_time DESC
        LIMIT $2`,
-      [rawLabel, limit]
+      queryValues
     );
+
+    await client.query('COMMIT');
+
+    console.log(`[calls/by-label] ✓ ${rows.length} rows in ${Date.now() - t0}ms` +
+      (rows.length ? `  first call_id=${rows[0].call_id}` : '  (no results)'));
 
     return res.json({
       field_name:     fieldName,
-      searched_label: rawLabel,
+      searched_label: searchLabel,
       limit,
       calls: rows.map(r => ({
         call_id:                   r.call_id,
         call_date:                 r.call_date_time,
         created_at:                r.created_at,
         agent_name:                r.agent_name || null,
-        matched_label:             rawLabel,
+        matched_label:             searchLabel,
         summary:                   r.call_summary || null,
         transcript_preview:        r.transcript_preview || null,
         full_transcript_available: !!r.full_transcript_available,
@@ -2498,16 +2751,32 @@ app.get('/api/calls/by-label', async (req, res) => {
       has_more: rows.length === limit,
     });
   } catch (err) {
+    const elapsed = Date.now() - t0;
+    if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
     // PostgreSQL error code 57014 = query_canceled (statement timeout)
     if (err.code === '57014') {
+      console.error(`[calls/by-label] ✗ query timeout after ${elapsed}ms — field=${fieldName} needs GIN index`);
       return res.status(504).json({
-        error: 'Call lookup timed out. This field does not have a GIN index and the result set is too large for direct lookup. Use the taxonomy_call_label_index backfill approach.',
+        error: 'Call lookup timed out. This field does not have a GIN index and the result set is too large for direct lookup.',
         timeout: true,
         field_name: fieldName,
       });
     }
-    console.error('/api/calls/by-label:', err.message);
-    return res.status(500).json({ error: err.message });
+    // Connection-level failure (pool timeout, TCP refused, ECONNREFUSED, etc.)
+    const msg = err.message || '';
+    const isConnErr = !client || err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' ||
+      msg.includes('timeout exceeded when trying to connect') ||
+      msg.includes('connect') || msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT');
+    if (isConnErr) {
+      console.error(`[calls/by-label] ✗ connection failed after ${elapsed}ms:`, msg);
+      console.error(`[calls/by-label]   APP_DB_HOST=${process.env.APP_DB_HOST || '(unset)'}  APP_DB_PORT=${process.env.APP_DB_PORT || '(unset)'}  APP_DB_NAME=${process.env.APP_DB_NAME || '(unset)'}`);
+      return res.status(503).json({
+        error: 'Cannot reach the calls database. Make sure you are connected to the VPN and that APP_DB_HOST / APP_DB_PORT are set correctly in the root .env file.',
+        detail: msg,
+      });
+    }
+    console.error(`[calls/by-label] ✗ error after ${elapsed}ms:`, msg);
+    return res.status(500).json({ error: msg });
   } finally {
     if (client) client.release();
   }
