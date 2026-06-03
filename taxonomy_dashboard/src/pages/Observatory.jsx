@@ -11,7 +11,7 @@ const SemanticScene = lazy(() => import('../components/scene/SemanticScene.jsx')
 
 const OBSERVATORY_FIELD_LIMIT = 8000
 const OBSERVATORY_GLOBAL_LIMIT = 8000
-const SEMANTIC_MIN_SCORE = 0.30
+const SEMANTIC_MIN_SCORE = 0.10  // Voyage rerank-2.5-lite scores top out lower than cosine similarity
 
 function safeQueryStr(q) {
   if (!q) return ''
@@ -203,10 +203,11 @@ function SceneLoader({ label = 'Initializing…' }) {
 }
 
 
-function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear, semanticClusters = [] }) {
+function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear, onRefreshIndex, semanticClusters = [] }) {
   const active = searchState?.active
   const loading = searchState?.loading
   const results = searchState?.results || []
+  const refreshing = searchState?.refreshing
   // Prefer enriched clusters (have _clusterKey and full composite identity) over raw API results
   const top = (active && semanticClusters.length ? semanticClusters : results).slice(0, 4)
   const scoped = selectedFields?.length === 1 ? selectedFields[0] : null
@@ -231,11 +232,31 @@ function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onS
           )}
         </div>
 
-        <button onClick={onSearch} disabled={loading || !query.trim()}
+        <button onClick={onSearch} disabled={loading || refreshing || !query.trim()}
           className="w-full flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-[9.5px] font-semibold transition-all duration-150 disabled:opacity-45 disabled:cursor-not-allowed"
           style={{ background: 'rgba(168,85,247,0.12)', border: '1px solid rgba(168,85,247,0.32)', color: '#c084fc' }}>
           {loading ? 'Searching embeddings…' : 'Find semantic clusters'}
         </button>
+
+        <button onClick={onRefreshIndex} disabled={refreshing || loading}
+          title="Rebuild the BGE-M3 FAISS index from the current taxonomy. Run this when search results look irrelevant or after a taxonomy update."
+          className="w-full flex items-center justify-center gap-1.5 rounded-lg py-1 text-[8.5px] font-medium transition-all duration-150 disabled:opacity-45 disabled:cursor-not-allowed"
+          style={{ background: 'rgba(6,182,212,0.07)', border: '1px solid rgba(6,182,212,0.20)', color: refreshing ? '#22d3ee' : '#475569' }}>
+          {refreshing ? '⟳ Rebuilding index (may take minutes)…' : '↺ Refresh search index'}
+        </button>
+
+        {searchState?.refreshError && (
+          <div className="text-[8px] leading-snug rounded px-2 py-1"
+            style={{ color: '#fb7185', background: 'rgba(244,63,94,0.07)', border: '1px solid rgba(244,63,94,0.18)' }}>
+            Refresh failed: {searchState.refreshError}
+          </div>
+        )}
+        {searchState?.refreshDone && (
+          <div className="text-[8px] leading-snug rounded px-2 py-1"
+            style={{ color: '#10b981', background: 'rgba(16,185,129,0.07)', border: '1px solid rgba(16,185,129,0.18)' }}>
+            ✓ Index rebuilt ({searchState.refreshDone.toLocaleString()} labels). Re-run your search.
+          </div>
+        )}
 
         {scoped && !active && (
           <div className="text-[8.5px] leading-snug" style={{ color: '#334155' }}>
@@ -315,7 +336,7 @@ export default function Observatory() {
   const [showProduction, setShowProduction] = useState(false)
   const [productionOverlay, setProductionOverlay] = useState({ available: false, rows: [], latest_run_id: null })
   const [semanticQuery, setSemanticQuery] = useState('')
-  const [semanticSearch, setSemanticSearch] = useState({ active: false, query: '', results: [], loading: false, error: null, engine: null })
+  const [semanticSearch, setSemanticSearch] = useState({ active: false, query: '', results: [], loading: false, error: null, engine: null, refreshing: false, refreshError: null, refreshDone: null })
 
   const sendSceneCommand = (action) => {
     window.dispatchEvent(new CustomEvent('semantic-scene-command', { detail: { action } }))
@@ -330,7 +351,19 @@ export default function Observatory() {
 
   const clearSemanticSearch = () => {
     setSemanticQuery('')
-    setSemanticSearch({ active: false, query: '', results: [], loading: false, error: null, engine: null })
+    setSemanticSearch({ active: false, query: '', results: [], loading: false, error: null, engine: null, refreshing: false, refreshError: null, refreshDone: null })
+  }
+
+  const refreshSemanticIndex = async () => {
+    setSemanticSearch(prev => ({ ...prev, refreshing: true, refreshError: null, refreshDone: null }))
+    try {
+      const r = await fetch('/api/semantic-index/refresh', { method: 'POST' })
+      const d = await r.json()
+      if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+      setSemanticSearch(prev => ({ ...prev, refreshing: false, refreshDone: d.indexed_docs ?? true }))
+    } catch (err) {
+      setSemanticSearch(prev => ({ ...prev, refreshing: false, refreshError: err.message }))
+    }
   }
 
   const runSemanticSearch = async (overrideQuery) => {
@@ -634,6 +667,7 @@ export default function Observatory() {
             selectedFields={selectedFields}
             onSearch={runSemanticSearch}
             onClear={clearSemanticSearch}
+            onRefreshIndex={refreshSemanticIndex}
             semanticClusters={semanticTopClusters}
           />
 

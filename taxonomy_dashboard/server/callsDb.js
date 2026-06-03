@@ -15,7 +15,7 @@ const callsPool = new Pool({
   password: process.env.APP_DB_PASS,
   max: 5,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: parseInt(process.env.CALLS_DB_CONNECT_TIMEOUT_MS || '20000', 10),
+  connectionTimeoutMillis: parseInt(process.env.CALLS_DB_CONNECT_TIMEOUT_MS || '8000', 10),
 });
 
 callsPool.on('error', err => console.error('[callsPool] idle client error:', err.message));

@@ -102,12 +102,27 @@ def get_conn():
     )
 
 
+def clean_label(s: str) -> str:
+    """Strip PostgreSQL array braces/quotes and convert underscores to spaces."""
+    import re
+    s = s.strip()
+    # Strip PG array literal braces  e.g. {Customer_Redirect} → Customer_Redirect
+    if s.startswith('{') and s.endswith('}'):
+        inner = s[1:-1]
+        parts = [p.strip().strip('"') for p in inner.split(',') if p.strip()]
+        s = ' '.join(parts)
+    else:
+        s = s.strip('"')
+    s = s.replace('_', ' ')
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 def build_emb_text(row: dict) -> str:
-    raw   = (row.get('raw_label')        or '').strip()
-    norm  = (row.get('normalized_label') or '').strip()
-    disp  = (row.get('display_name')     or '').strip()
-    medo  = (row.get('medoid_label')     or '').strip()
-    field = (row.get('field_name')       or '').strip()
+    raw   = clean_label(row.get('raw_label')        or '')
+    norm  = clean_label(row.get('normalized_label') or '')
+    disp  = (row.get('display_name')                or '').strip()
+    medo  = clean_label(row.get('medoid_label')     or '')
+    field = (row.get('field_name')                  or '').replace('_', ' ').strip()
     parts = []
     if raw:                                parts.append(raw)
     if norm and norm != raw:               parts.append(norm)
@@ -120,12 +135,14 @@ def build_emb_text(row: dict) -> str:
 # ── index ─────────────────────────────────────────────────────────────────────
 def load_or_build_index(bge_model, rebuild: bool = False) -> dict:
     if not rebuild and CACHE_PATH.exists():
-        age = time.time() - CACHE_PATH.stat().st_mtime
-        if age < INDEX_MAX_AGE_SECS:
-            log(f'[bge_voyage] loading cached index (age={age/3600:.1f}h)')
+        try:
             with open(CACHE_PATH, 'rb') as f:
-                return pickle.load(f)
-        log(f'[bge_voyage] cache stale ({age/3600:.1f}h), rebuilding')
+                data = pickle.load(f)
+            return data
+            
+        except Exception as exc:
+            log(f'[bge_voyage] cache load failed ({exc}) — rebuilding')
+
 
     log('[bge_voyage] loading taxonomy labels from DB ...')
     conn = get_conn()
@@ -330,6 +347,7 @@ def main() -> int:
               'detail': traceback.format_exc(limit=4)})
         return 4
 
+    index_age_h = round((time.time() - cache.get('built_at', time.time())) / 3600, 1)
     emit({
         'type':          'ready',
         'model':         f'{BGE_MODEL}+{VOYAGE_RERANK_MODEL}',
@@ -337,6 +355,7 @@ def main() -> int:
         'rerank_model':  VOYAGE_RERANK_MODEL,
         'dimension':     dim,
         'indexed_docs':  len(cache['docs']),
+        'index_age_h':   index_age_h,
     })
 
     for line in sys.stdin:

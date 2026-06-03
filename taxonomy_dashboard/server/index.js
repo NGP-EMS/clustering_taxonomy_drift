@@ -349,6 +349,27 @@ class BgeVoyageWorker {
       }
     });
   }
+
+  async refresh() {
+    await this.start();
+    // Embedding all labels can take several minutes — allow up to 20 min
+    const timeoutMs = 20 * 60 * 1000;
+    const id = String(this.nextId++);
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('BGE/Voyage index refresh timed out after 20 minutes'));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.child.stdin.write(`${JSON.stringify({ id, type: 'refresh_index' })}\n`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
 }
 
 const bgeVoyageWorker = new BgeVoyageWorker();
@@ -2595,13 +2616,43 @@ app.get('/api/semantic-search', async (req, res) => {
   }
 });
 
+// ── Semantic index refresh ─────────────────────────────────────────────────────
+app.post('/api/semantic-index/refresh', async (req, res) => {
+  const _provider = (process.env.SEMANTIC_SEARCH_PROVIDER || '').toLowerCase().trim();
+  if (_provider !== 'bge_voyage') {
+    return res.status(400).json({ error: 'Index refresh is only supported for SEMANTIC_SEARCH_PROVIDER=bge_voyage' });
+  }
+  try {
+    console.log('[semantic-index/refresh] rebuild requested');
+    const result = await bgeVoyageWorker.refresh();
+    console.log(`[semantic-index/refresh] done — indexed_docs=${result.indexed_docs}`);
+    return res.json({ ok: true, indexed_docs: result.indexed_docs });
+  } catch (err) {
+    console.error('[semantic-index/refresh] failed:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Call Evidence ─────────────────────────────────────────────────────────────
 const callsPool = require('./callsDb');
 
-// Taxonomy field_name → column type in ngp_call_classification.
-// Array fields use $1 = ANY(col) structural matching (no LIKE).
-// Fields marked indexed:false have no GIN index — queries will seq-scan and may timeout;
-// TODO: replace with taxonomy_call_label_index once backfill is ready.
+// Server-side result cache so unindexed-field seq-scans only run once per session.
+// Key: "fieldName\x00rawLabel"  Value: { ts, payload }
+const _callsCache = new Map();
+const CALLS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCachedCalls(key) {
+  const e = _callsCache.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > CALLS_CACHE_TTL_MS) { _callsCache.delete(key); return null; }
+  return e.payload;
+}
+function setCachedCalls(key, payload) {
+  _callsCache.set(key, { ts: Date.now(), payload });
+  if (_callsCache.size > 400) _callsCache.delete(_callsCache.keys().next().value);
+}
+
+
 const TAXONOMY_FIELD_MAP = {
   call_type:            { type: 'scalar' }, // btree indexed
   call_type_base:       { type: 'scalar' }, // btree indexed
@@ -2619,12 +2670,7 @@ const TAXONOMY_FIELD_MAP = {
   rate_type:            { type: 'array',  indexed: false }, // TODO: needs GIN index
 };
 
-// Parse a taxonomy raw_label that may be stored as a PostgreSQL array literal.
-// Returns { values: string[], multi: bool }
-// Examples:
-//   "Customer_Hung_Up"    → { values: ['Customer_Hung_Up'], multi: false }
-//   "{Customer_Hung_Up}"  → { values: ['Customer_Hung_Up'], multi: false }
-//   "{Renewal,Pitch}"     → { values: ['Renewal','Pitch'],   multi: true  }
+
 function parseCallLabel(label) {
   if (label.startsWith('{') && label.endsWith('}')) {
     const inner = label.slice(1, -1);
@@ -2664,80 +2710,104 @@ app.get('/api/calls/by-label', async (req, res) => {
     console.log(`[calls/by-label] label parsed: ${JSON.stringify(rawLabel)} → [${labelValues.map(v => JSON.stringify(v)).join(', ')}]`);
   }
 
-  // Unindexed array fields need a GIN index on the production DB or every
-  // lookup is a full sequential scan of ~4M rows.  Fail fast with instructions
-  // rather than hanging for 8 s before timing out.
-  if (colDef.type === 'array' && colDef.indexed === false) {
-    console.log(`[calls/by-label] ✗ field "${fieldName}" has no GIN index — rejecting to avoid seq-scan`);
-    return res.status(422).json({
-      error: `"${fieldName}" does not have a GIN index on the calls database. Call lookup for this field requires a GIN index to be fast.`,
-      hint: `Run this on the ai-calls-analysis-db to enable it:\nCREATE INDEX CONCURRENTLY idx_ngp_cc_${fieldName} ON ngp_call_classification USING GIN(${fieldName}) WHERE sequence = 1;`,
-      field_name: fieldName,
-      no_index: true,
-    });
+  const isArrayField = colDef.type === 'array';
+  const cacheKey = `${fieldName}\x00${rawLabel}`;
+
+  // Serve from cache (avoids repeated slow queries)
+  const cached = getCachedCalls(cacheKey);
+  if (cached) {
+    console.log(`[calls/by-label] cache hit for ${fieldName}:${rawLabel}`);
+    return res.json({ ...cached, from_cache: true });
   }
 
-  console.log(`[calls/by-label] field type=${colDef.type} indexed=${colDef.indexed} — connecting to calls DB...`);
+  console.log(`[calls/by-label] field type=${colDef.type} — connecting to calls DB...`);
 
-  // Build WHERE clause:
-  //   scalar field       → col = $1
-  //   array, single val  → $1 = ANY(col)          ← uses GIN index
-  //   array, multi val   → col @> ARRAY[...]       ← GIN contains, all values must match
-  let whereExpr, queryValues;
-  if (colDef.type === 'array') {
+  let arrayWhereExpr, scalarWhereExpr, queryValues;
+  if (isArrayField) {
     if (isMultiLabel) {
-      whereExpr = `nc."${fieldName}" @> $1::text[]`;
+      arrayWhereExpr = `nc."${fieldName}" @> $1::text[]`;
       queryValues = [labelValues, limit];
     } else {
-      whereExpr = `$1 = ANY(nc."${fieldName}")`;
+      arrayWhereExpr = `nc."${fieldName}" @> ARRAY[$1::text]`;
       queryValues = [labelValues[0], limit];
     }
   } else {
-    whereExpr = `nc."${fieldName}" = $1`;
+    scalarWhereExpr = `nc."${fieldName}" = $1`;
     queryValues = [labelValues[0], limit];
   }
 
   console.log(`[calls/by-label] WHERE ${isMultiLabel
     ? `"${fieldName}" @> [${labelValues.map(v => JSON.stringify(v)).join(',')}]`
-    : whereExpr.replace('$1', JSON.stringify(queryValues[0]))}`);
+    : `"${fieldName}" ${isArrayField ? '@>' : '='} ${JSON.stringify(queryValues[0])}`}`);
+
 
   let client;
   try {
     client = await callsPool.connect();
     console.log(`[calls/by-label] connected (${Date.now() - t0}ms) — running query...`);
 
-    // SET LOCAL only works inside an explicit transaction; without BEGIN the
-    // timeout silently applies only to the SET statement, not the SELECT.
     await client.query('BEGIN');
     await client.query("SET LOCAL statement_timeout = '8000'");
 
-    const { rows } = await client.query(
-      `SELECT
-         nc.call_id,
-         nc.call_date_time,
-         nc.created_at,
-         nc.agent_name,
-         nc.call_summary,
-         SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
-         (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
-       FROM ngp_call_classification nc
-       LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
-       WHERE ${whereExpr}
-         AND nc.sequence = 1
-       ORDER BY nc.call_date_time DESC
-       LIMIT $2`,
-      queryValues
-    );
+    let rows = [];
+
+    if (isArrayField) {
+     
+      const { rows: r } = await client.query(
+        `SELECT
+           nc.call_id,
+           nc.call_date_time,
+           nc.created_at,
+           nc.agent_name,
+           nc.call_summary,
+           SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
+           (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
+         FROM (
+           SELECT *
+           FROM ngp_call_classification
+           WHERE sequence = 1
+           ORDER BY call_date_time DESC
+           
+         ) nc
+         LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
+         WHERE ${arrayWhereExpr}
+         ORDER BY nc.call_date_time DESC
+         LIMIT $2`,
+        queryValues
+      );
+      rows = r;
+      console.log(`[calls/by-label] : ${rows.length} rows in ${Date.now() - t0}ms`);
+    } else {
+      // Scalar field with btree index — direct lookup, fast.
+      const { rows: r } = await client.query(
+        `SELECT
+           nc.call_id,
+           nc.call_date_time,
+           nc.created_at,
+           nc.agent_name,
+           nc.call_summary,
+           SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
+           (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
+         FROM ngp_call_classification nc
+         LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
+         WHERE ${scalarWhereExpr}
+           AND nc.sequence = 1
+         ORDER BY nc.call_date_time DESC
+         LIMIT $2`,
+        queryValues
+      );
+      rows = r;
+    }
 
     await client.query('COMMIT');
 
-    console.log(`[calls/by-label] ✓ ${rows.length} rows in ${Date.now() - t0}ms` +
-      (rows.length ? `  first call_id=${rows[0].call_id}` : '  (no results)'));
 
-    return res.json({
+    const payload = {
       field_name:     fieldName,
       searched_label: searchLabel,
       limit,
+      field_indexed:  colDef.indexed !== false,
+      date_filtered:  isArrayField,
       calls: rows.map(r => ({
         call_id:                   r.call_id,
         call_date:                 r.call_date_time,
@@ -2749,21 +2819,25 @@ app.get('/api/calls/by-label', async (req, res) => {
         full_transcript_available: !!r.full_transcript_available,
       })),
       has_more: rows.length === limit,
-    });
+    };
+
+    setCachedCalls(cacheKey, payload);
+    return res.json(payload);
   } catch (err) {
     const elapsed = Date.now() - t0;
     if (client) { try { await client.query('ROLLBACK'); } catch (_) {} }
+
+    const msg = err.message || '';
+
     // PostgreSQL error code 57014 = query_canceled (statement timeout)
     if (err.code === '57014') {
-      console.error(`[calls/by-label] ✗ query timeout after ${elapsed}ms — field=${fieldName} needs GIN index`);
-      return res.status(504).json({
-        error: 'Call lookup timed out. This field does not have a GIN index and the result set is too large for direct lookup.',
-        timeout: true,
-        field_name: fieldName,
+      console.error(`[calls/by-label] ✗ statement timeout after ${elapsed}ms`);
+      return res.status(422).json({
+        error: `Query timed out after ${elapsed}ms. This field may need a GIN index on the calls database for fast lookups.`,
       });
     }
+
     // Connection-level failure (pool timeout, TCP refused, ECONNREFUSED, etc.)
-    const msg = err.message || '';
     const isConnErr = !client || err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' ||
       msg.includes('timeout exceeded when trying to connect') ||
       msg.includes('connect') || msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT');

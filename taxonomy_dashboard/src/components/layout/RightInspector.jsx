@@ -24,10 +24,12 @@ function safeQueryStr(q) {
   return String(q)
 }
 
+// Voyage rerank-2.5-lite scores top out ~0.6-0.8 for excellent matches;
+// calibrate bands lower than cosine-similarity thresholds.
 function confBand(score) {
   const s = Number(score) || 0
-  if (s >= 0.75) return { label: 'Confident', color: '#10b981', bg: 'rgba(16,185,129,0.10)', border: 'rgba(16,185,129,0.28)' }
-  if (s >= 0.60) return { label: 'Possible',  color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  border: 'rgba(245,158,11,0.28)'  }
+  if (s >= 0.55) return { label: 'Confident', color: '#10b981', bg: 'rgba(16,185,129,0.10)', border: 'rgba(16,185,129,0.28)' }
+  if (s >= 0.30) return { label: 'Possible',  color: '#f59e0b', bg: 'rgba(245,158,11,0.10)',  border: 'rgba(245,158,11,0.28)'  }
   return              { label: 'Weak',       color: '#64748b', bg: 'rgba(100,116,139,0.08)', border: 'rgba(100,116,139,0.20)' }
 }
 
@@ -589,9 +591,9 @@ export default function RightInspector({ clusterId, semanticMatchedLabels = [], 
             <>
               {(() => {
                 const queryStr = safeQueryStr(semanticQuery)
-                const confident = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) >= 0.75)
-                const possible  = semanticMatchedLabels.filter(m => { const s = Number(labelScore(m)) || 0; return s >= 0.60 && s < 0.75 })
-                const weak      = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) < 0.60)
+                const confident = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) >= 0.55)
+                const possible  = semanticMatchedLabels.filter(m => { const s = Number(labelScore(m)) || 0; return s >= 0.30 && s < 0.55 })
+                const weak      = semanticMatchedLabels.filter(m => (Number(labelScore(m)) || 0) < 0.30)
                 const hasWeak   = possible.length > 0 || weak.length > 0
 
                 const clusterFieldName = cluster?.field_name || parsedField
