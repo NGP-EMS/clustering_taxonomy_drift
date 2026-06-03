@@ -231,6 +231,163 @@ def normalize_label(value: Any) -> str:
     return text.strip()
 
 
+
+# -----------------------------------------------------------------------------
+# Actor-aware directionality guard
+# -----------------------------------------------------------------------------
+
+ACTOR_ALIAS_TO_CANONICAL = {
+    "agent": "agent",
+    "advisor": "agent",
+    "adviser": "agent",
+    "rep": "agent",
+    "representative": "agent",
+    "consultant": "agent",
+    "salesperson": "agent",
+    "customer": "customer",
+    "client": "customer",
+    "prospect": "customer",
+    "lead": "customer",
+    "contact": "customer",
+    "caller": "customer",
+    "gatekeeper": "customer",
+    "dm": "customer",
+    "decision maker": "customer",
+    "decision-maker": "customer",
+    "business owner": "customer",
+}
+
+ACTOR_ACTION_KEYWORDS = {
+    "rudeness_or_abuse": {
+        "abuse", "abused", "abusive", "accuse", "accused", "argue", "argued",
+        "aggressive", "aggression", "blame", "blamed", "curse", "cursed", "cussed",
+        "hostile", "insult", "insulted", "insulting", "rude", "rudeness",
+        "shout", "shouted", "shouting", "swear", "swore", "swearing",
+        "threat", "threaten", "threatened", "yell", "yelled", "yelling",
+    },
+    "disconnect_or_hangup": {
+        "abandon", "abandoned", "cut", "disconnected", "disconnect", "dropped",
+        "ended", "hang", "hanged", "hung", "terminate", "terminated",
+    },
+    "refusal_or_rejection": {
+        "decline", "declined", "reject", "rejected", "refusal", "refuse", "refused",
+    },
+}
+
+
+def _actor_token_positions(normalized_text: str) -> list[tuple[int, str, str]]:
+    tokens = normalized_text.split()
+    positions: list[tuple[int, str, str]] = []
+    used_positions: set[int] = set()
+
+    phrase_aliases = sorted(
+        [alias for alias in ACTOR_ALIAS_TO_CANONICAL if " " in alias or "-" in alias],
+        key=lambda value: len(value.split()),
+        reverse=True,
+    )
+    for alias in phrase_aliases:
+        alias_tokens = normalize_label(alias).split()
+        size = len(alias_tokens)
+        if not alias_tokens:
+            continue
+        for idx in range(0, max(0, len(tokens) - size + 1)):
+            if any((idx + offset) in used_positions for offset in range(size)):
+                continue
+            if tokens[idx : idx + size] == alias_tokens:
+                positions.append((idx, ACTOR_ALIAS_TO_CANONICAL[alias], alias))
+                used_positions.update(idx + offset for offset in range(size))
+
+    for idx, token in enumerate(tokens):
+        if idx in used_positions:
+            continue
+        if token in ACTOR_ALIAS_TO_CANONICAL:
+            positions.append((idx, ACTOR_ALIAS_TO_CANONICAL[token], token))
+
+    positions.sort(key=lambda item: item[0])
+    return positions
+
+
+def _action_categories_between(tokens: list[str], start: int, end: int) -> set[str]:
+    if start > end:
+        start, end = end, start
+    window = tokens[max(0, start): min(len(tokens), end + 1)]
+    found: set[str] = set()
+    for category, words in ACTOR_ACTION_KEYWORDS.items():
+        if any(token in words for token in window):
+            found.add(category)
+    return found
+
+
+def extract_actor_relations(text: Any) -> list[dict[str, str]]:
+    normalized = normalize_label(text)
+    if not normalized:
+        return []
+
+    tokens = normalized.split()
+    actors = _actor_token_positions(normalized)
+    relations: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for left_idx, left_actor, _left_alias in actors:
+        for right_idx, right_actor, _right_alias in actors:
+            if left_idx == right_idx or left_actor == right_actor:
+                continue
+            distance = abs(right_idx - left_idx)
+            if distance > 10:
+                continue
+
+            between_start = min(left_idx, right_idx)
+            between_end = max(left_idx, right_idx)
+            action_categories = _action_categories_between(tokens, between_start, between_end)
+            if not action_categories:
+                # Allow compact forms like "agent customer abuse" where the action lands
+                # immediately after the second actor.
+                action_categories = _action_categories_between(tokens, between_start, min(len(tokens) - 1, between_end + 3))
+            if not action_categories:
+                continue
+
+            actor = left_actor if left_idx < right_idx else right_actor
+            target = right_actor if left_idx < right_idx else left_actor
+
+            # Passive form: "customer insulted by agent" means agent -> customer.
+            low = min(left_idx, right_idx)
+            high = max(left_idx, right_idx)
+            if "by" in tokens[low: high + 1]:
+                actor = right_actor if right_idx > left_idx else left_actor
+                target = left_actor if right_idx > left_idx else right_actor
+
+            for action in action_categories:
+                key = (actor, target, action)
+                if key not in seen:
+                    seen.add(key)
+                    relations.append({"actor": actor, "target": target, "action": action})
+
+    return relations
+
+
+def actor_directionality_check(candidate_text: Any, target_text: Any) -> dict[str, Any]:
+    candidate_relations = extract_actor_relations(candidate_text)
+    target_relations = extract_actor_relations(target_text)
+    conflict_pairs = []
+
+    for cand in candidate_relations:
+        for target in target_relations:
+            if cand["action"] != target["action"]:
+                continue
+            if cand["actor"] == target["target"] and cand["target"] == target["actor"]:
+                conflict_pairs.append({"candidate": cand, "target": target})
+
+    return {
+        "candidate_relations": candidate_relations,
+        "target_relations": target_relations,
+        "actor_direction_conflict": bool(conflict_pairs),
+        "conflict_pairs": conflict_pairs,
+    }
+
+
+def has_actor_direction_conflict(candidate_text: Any, target_text: Any) -> bool:
+    return bool(actor_directionality_check(candidate_text, target_text)["actor_direction_conflict"])
+
 def coaching_aware_embedding_text(label: Any) -> str:
     label_text = str(label or "")
     label_lower = label_text.lower()
@@ -1370,39 +1527,54 @@ def _rank_cluster_candidates(
     scores = cosine_similarity_matrix(query, centroids)
     order = np.argsort(scores)[::-1]
 
+    label_text = " ".join([item.raw_label, item.normalized_label])
     top_candidates: List[Dict[str, Any]] = []
-    for idx in order[:top_k]:
+    best_allowed_cluster: Optional[ClusterReference] = None
+    best_allowed_score: Optional[float] = None
+    best_allowed_threshold: Optional[float] = None
+
+    for rank, idx in enumerate(order):
         cluster = clusters[int(idx)]
         threshold = effective_existing_threshold(
             field_name=item.field_name,
             cluster_threshold=cluster.similarity_threshold,
             field_threshold_overrides=field_existing_thresholds,
         )
-        top_candidates.append(
-            {
-                "cluster_id": cluster.cluster_id,
-                "cluster_name": cluster.cluster_name,
-                "display_name": cluster.display_name,
-                "similarity_score": float(scores[int(idx)]),
-                "cluster_version": cluster.cluster_version,
-                "cluster_size": cluster.cluster_size,
-                "total_occurrences": cluster.total_occurrences,
-                "medoid_label": cluster.medoid_label,
-                "similarity_threshold": threshold,
-                "is_true_anomaly_cluster": cluster.is_true_anomaly_cluster,
-                "source": source,
-            }
+        target_text = " ".join(
+            str(value or "")
+            for value in [cluster.display_name, cluster.cluster_name, cluster.medoid_label]
         )
+        actor_check = actor_directionality_check(label_text, target_text)
+        actor_conflict = bool(actor_check["actor_direction_conflict"])
 
-    best_idx = int(order[0])
-    best_cluster = clusters[best_idx]
-    best_score = float(scores[best_idx])
-    best_threshold = effective_existing_threshold(
-        field_name=item.field_name,
-        cluster_threshold=best_cluster.similarity_threshold,
-        field_threshold_overrides=field_existing_thresholds,
-    )
-    return top_candidates, best_cluster, best_score, best_threshold
+        if rank < top_k:
+            top_candidates.append(
+                {
+                    "cluster_id": cluster.cluster_id,
+                    "cluster_name": cluster.cluster_name,
+                    "display_name": cluster.display_name,
+                    "similarity_score": float(scores[int(idx)]),
+                    "cluster_version": cluster.cluster_version,
+                    "cluster_size": cluster.cluster_size,
+                    "total_occurrences": cluster.total_occurrences,
+                    "medoid_label": cluster.medoid_label,
+                    "similarity_threshold": threshold,
+                    "is_true_anomaly_cluster": cluster.is_true_anomaly_cluster,
+                    "source": source,
+                    "actor_direction_conflict": actor_conflict,
+                    "actor_directionality_check": actor_check,
+                }
+            )
+
+        if actor_conflict:
+            continue
+
+        if best_allowed_cluster is None:
+            best_allowed_cluster = cluster
+            best_allowed_score = float(scores[int(idx)])
+            best_allowed_threshold = threshold
+
+    return top_candidates, best_allowed_cluster, best_allowed_score, best_allowed_threshold
 
 
 def map_embedded_label_to_cluster(

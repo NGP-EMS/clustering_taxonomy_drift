@@ -312,6 +312,157 @@ def has_contradiction(candidate: str, target: str) -> bool:
     return False
 
 
+
+# -----------------------------------------------------------------------------
+# Actor-aware directionality guard
+# -----------------------------------------------------------------------------
+
+ACTOR_ALIAS_TO_CANONICAL = {
+    "agent": "agent",
+    "advisor": "agent",
+    "adviser": "agent",
+    "rep": "agent",
+    "representative": "agent",
+    "consultant": "agent",
+    "salesperson": "agent",
+    "customer": "customer",
+    "client": "customer",
+    "prospect": "customer",
+    "lead": "customer",
+    "contact": "customer",
+    "caller": "customer",
+    "gatekeeper": "customer",
+    "dm": "customer",
+    "decision maker": "customer",
+    "decision-maker": "customer",
+    "business owner": "customer",
+}
+
+ACTOR_ACTION_KEYWORDS = {
+    "rudeness_or_abuse": {
+        "abuse", "abused", "abusive", "accuse", "accused", "argue", "argued",
+        "aggressive", "aggression", "blame", "blamed", "curse", "cursed", "cussed",
+        "hostile", "insult", "insulted", "insulting", "rude", "rudeness",
+        "shout", "shouted", "shouting", "swear", "swore", "swearing",
+        "threat", "threaten", "threatened", "yell", "yelled", "yelling",
+    },
+    "disconnect_or_hangup": {
+        "abandon", "abandoned", "cut", "disconnected", "disconnect", "dropped",
+        "ended", "hang", "hanged", "hung", "terminate", "terminated",
+    },
+    "refusal_or_rejection": {
+        "decline", "declined", "reject", "rejected", "refusal", "refuse", "refused",
+    },
+}
+
+
+def _actor_token_positions(normalized_text: str) -> list[tuple[int, str, str]]:
+    tokens = normalized_text.split()
+    positions: list[tuple[int, str, str]] = []
+    used_positions: set[int] = set()
+
+    phrase_aliases = sorted(
+        [alias for alias in ACTOR_ALIAS_TO_CANONICAL if " " in alias or "-" in alias],
+        key=lambda value: len(value.split()),
+        reverse=True,
+    )
+    for alias in phrase_aliases:
+        alias_tokens = normalize_label(alias).split()
+        size = len(alias_tokens)
+        if not alias_tokens:
+            continue
+        for idx in range(0, max(0, len(tokens) - size + 1)):
+            if any((idx + offset) in used_positions for offset in range(size)):
+                continue
+            if tokens[idx : idx + size] == alias_tokens:
+                positions.append((idx, ACTOR_ALIAS_TO_CANONICAL[alias], alias))
+                used_positions.update(idx + offset for offset in range(size))
+
+    for idx, token in enumerate(tokens):
+        if idx in used_positions:
+            continue
+        if token in ACTOR_ALIAS_TO_CANONICAL:
+            positions.append((idx, ACTOR_ALIAS_TO_CANONICAL[token], token))
+
+    positions.sort(key=lambda item: item[0])
+    return positions
+
+
+def _action_categories_between(tokens: list[str], start: int, end: int) -> set[str]:
+    if start > end:
+        start, end = end, start
+    window = tokens[max(0, start): min(len(tokens), end + 1)]
+    found: set[str] = set()
+    for category, words in ACTOR_ACTION_KEYWORDS.items():
+        if any(token in words for token in window):
+            found.add(category)
+    return found
+
+
+def extract_actor_relations(text: Any) -> list[dict[str, str]]:
+    normalized = normalize_label(text)
+    if not normalized:
+        return []
+
+    tokens = normalized.split()
+    actors = _actor_token_positions(normalized)
+    relations: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for left_idx, left_actor, _left_alias in actors:
+        for right_idx, right_actor, _right_alias in actors:
+            if left_idx == right_idx or left_actor == right_actor:
+                continue
+            distance = abs(right_idx - left_idx)
+            if distance > 10:
+                continue
+
+            low = min(left_idx, right_idx)
+            high = max(left_idx, right_idx)
+            action_categories = _action_categories_between(tokens, low, high)
+            if not action_categories:
+                action_categories = _action_categories_between(tokens, low, min(len(tokens) - 1, high + 3))
+            if not action_categories:
+                continue
+
+            actor = left_actor if left_idx < right_idx else right_actor
+            target = right_actor if left_idx < right_idx else left_actor
+            if "by" in tokens[low: high + 1]:
+                actor = right_actor if right_idx > left_idx else left_actor
+                target = left_actor if right_idx > left_idx else right_actor
+
+            for action in action_categories:
+                key = (actor, target, action)
+                if key not in seen:
+                    seen.add(key)
+                    relations.append({"actor": actor, "target": target, "action": action})
+
+    return relations
+
+
+def actor_directionality_check(candidate_text: Any, target_text: Any) -> dict[str, Any]:
+    candidate_relations = extract_actor_relations(candidate_text)
+    target_relations = extract_actor_relations(target_text)
+    conflict_pairs = []
+
+    for cand in candidate_relations:
+        for target in target_relations:
+            if cand["action"] != target["action"]:
+                continue
+            if cand["actor"] == target["target"] and cand["target"] == target["actor"]:
+                conflict_pairs.append({"candidate": cand, "target": target})
+
+    return {
+        "candidate_relations": candidate_relations,
+        "target_relations": target_relations,
+        "actor_direction_conflict": bool(conflict_pairs),
+        "conflict_pairs": conflict_pairs,
+    }
+
+
+def has_actor_direction_conflict(candidate_text: Any, target_text: Any) -> bool:
+    return bool(actor_directionality_check(candidate_text, target_text)["actor_direction_conflict"])
+
 def to_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
@@ -1077,6 +1228,15 @@ class UnresolvedGroup:
         return centroid(self.label_vectors)
 
 
+@dataclass
+class KnownAnomalyEvidenceGroup:
+    field_name: str
+    cluster_id: str
+    cluster_version: Optional[str]
+    display_name: Optional[str]
+    group: UnresolvedGroup
+
+
 def load_unresolved_groups(conn, args: argparse.Namespace, window_start: datetime, window_end: datetime) -> list[UnresolvedGroup]:
     output_t = safe_pg_qualified_name(args.output_table)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1144,6 +1304,103 @@ def load_unresolved_groups(conn, args: argparse.Namespace, window_start: datetim
     return out
 
 
+def load_known_anomaly_evidence_groups(conn, args: argparse.Namespace, window_start: datetime, window_end: datetime) -> list[KnownAnomalyEvidenceGroup]:
+    """
+    Load already-known anomaly rows created by the hourly mapper.
+
+    These rows are not unresolved; they already matched active true-anomaly
+    clusters. Weekly still has to attach the new raw/normalized labels to the
+    anomaly cluster, refresh counters, and promote the cluster if recurring
+    evidence crosses the configured threshold.
+    """
+    output_t = safe_pg_qualified_name(args.output_table)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                field_name,
+                mapped_cluster_id,
+                mapped_display_name,
+                cluster_version,
+                normalized_label,
+                raw_label,
+                source_record_id,
+                mapper_run_id,
+                mapping_status,
+                similarity_score,
+                label_embedding,
+                top_candidates,
+                COALESCE(classified_at, created_at) AS event_time
+            FROM {output_t}
+            WHERE mapping_status = 'KNOWN_TRUE_ANOMALY'
+              AND mapped_cluster_id IS NOT NULL
+              AND normalized_label IS NOT NULL
+              AND normalized_label <> ''
+              AND COALESCE(classified_at, created_at) >= %s
+              AND COALESCE(classified_at, created_at) < %s
+            ORDER BY field_name, mapped_cluster_id, normalized_label, event_time
+            """,
+            (window_start, window_end),
+        )
+        rows = cur.fetchall()
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    cluster_meta: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        field = str(row.get("field_name") or "")
+        cluster_id = str(row.get("mapped_cluster_id") or "")
+        norm = normalize_label(row.get("normalized_label"))
+        if not field or not cluster_id or not norm:
+            continue
+        grouped[(field, cluster_id, norm)].append(row)
+        cluster_meta.setdefault(
+            (field, cluster_id),
+            {
+                "cluster_version": row.get("cluster_version"),
+                "display_name": row.get("mapped_display_name"),
+            },
+        )
+
+    out: list[KnownAnomalyEvidenceGroup] = []
+    for (field, cluster_id, norm), members in grouped.items():
+        sims = [float(m["similarity_score"]) for m in members if m.get("similarity_score") is not None]
+        vectors = [parse_vector(m.get("label_embedding")) for m in members]
+        vectors = [v for v in vectors if v is not None]
+        candidates: list[dict[str, Any]] = []
+        for m in members:
+            parsed = parse_jsonish(m.get("top_candidates"))
+            if isinstance(parsed, list):
+                candidates.extend([x for x in parsed if isinstance(x, dict)])
+        event_times = [m.get("event_time") for m in members if m.get("event_time") is not None]
+        meta = cluster_meta.get((field, cluster_id), {})
+        group = UnresolvedGroup(
+            field_name=field,
+            normalized_label=norm,
+            statuses=["KNOWN_TRUE_ANOMALY" for _ in members],
+            raw_labels=[str(m.get("raw_label") or "") for m in members if str(m.get("raw_label") or "").strip()],
+            source_record_ids=sorted({str(m.get("source_record_id") or "") for m in members if m.get("source_record_id")}),
+            mapper_run_ids=sorted({str(m.get("mapper_run_id") or "") for m in members if m.get("mapper_run_id")}),
+            row_count=len(members),
+            distinct_call_count=len({str(m.get("source_record_id") or "") for m in members if m.get("source_record_id")}),
+            avg_similarity=float(np.mean(sims)) if sims else None,
+            max_similarity=float(max(sims)) if sims else None,
+            label_vectors=vectors,
+            top_candidates=candidates,
+            first_seen=min(event_times) if event_times else None,
+            last_seen=max(event_times) if event_times else None,
+        )
+        out.append(
+            KnownAnomalyEvidenceGroup(
+                field_name=field,
+                cluster_id=cluster_id,
+                cluster_version=str(meta.get("cluster_version") or args.weekly_cluster_version or "weekly"),
+                display_name=meta.get("display_name"),
+                group=group,
+            )
+        )
+    return out
+
+
 def choose_top_standard_candidate(group: UnresolvedGroup) -> Optional[dict[str, Any]]:
     candidates = [c for c in group.top_candidates if c.get("cluster_id")]
     if not candidates:
@@ -1203,6 +1460,8 @@ def deterministic_safe_map_check(group: UnresolvedGroup, top_candidate: dict[str
     target_tokens = token_set(target_text)
     overlap = sorted(cand_tokens & target_tokens)
 
+    actor_check = actor_directionality_check(candidate_text, target_text)
+
     checks = {
         "score": score,
         "threshold": threshold,
@@ -1215,6 +1474,8 @@ def deterministic_safe_map_check(group: UnresolvedGroup, top_candidate: dict[str
         "component_overlap": overlap,
         "shares_key_components": bool(overlap),
         "contradiction": has_contradiction(candidate_text, target_text),
+        "actor_direction_conflict": bool(actor_check["actor_direction_conflict"]),
+        "actor_directionality_check": actor_check,
     }
 
     passed = all(
@@ -1224,6 +1485,7 @@ def deterministic_safe_map_check(group: UnresolvedGroup, top_candidate: dict[str
             checks["strong_margin"],
             checks["shares_key_components"],
             not checks["contradiction"],
+            not checks["actor_direction_conflict"],
         ]
     )
     return bool(passed), checks
@@ -1270,10 +1532,22 @@ def nearest_anomaly_cluster(conn, args: argparse.Namespace, group: UnresolvedGro
         return None, None
     best = None
     best_score = -1.0
+    candidate_text = " ".join([group.normalized_label] + group.raw_labels[:5])
     for row in load_active_anomaly_clusters(conn, args, group.field_name):
+        target_text = " ".join(
+            str(row.get(k) or "")
+            for k in ["display_name", "cluster_name", "medoid_label"]
+        )
+        actor_check = actor_directionality_check(candidate_text, target_text)
+        if actor_check["actor_direction_conflict"]:
+            row["actor_direction_conflict"] = True
+            row["actor_directionality_check"] = actor_check
+            continue
         vec = parse_vector(row.get("centroid_embedding"))
         sim = cosine_similarity(gvec, vec)
         if sim is not None and sim > best_score:
+            row["actor_direction_conflict"] = False
+            row["actor_directionality_check"] = actor_check
             best = row
             best_score = sim
     if best is None:
@@ -1988,6 +2262,39 @@ def update_mapper_output_to_standard_cluster(
         return int(cur.rowcount or 0)
 
 
+def update_mapper_output_cluster_to_standard(
+    conn,
+    args: argparse.Namespace,
+    *,
+    field_name: str,
+    cluster_id: str,
+    display_name: str,
+    mapping_method: str = "weekly_promoted_known_anomaly_cluster",
+) -> int:
+    """Update every mapper output row currently pointing at a promoted anomaly cluster."""
+    if not args.update_mapper_output:
+        return 0
+
+    output_t = safe_pg_qualified_name(args.output_table)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {output_t}
+            SET mapped_cluster_id = %s,
+                mapped_cluster_name = %s,
+                mapped_display_name = %s,
+                mapping_status = 'EXISTING_CLUSTER',
+                mapping_method = %s,
+                updated_at = NOW()
+            WHERE field_name = %s
+              AND mapped_cluster_id = %s
+              AND mapping_status = 'KNOWN_TRUE_ANOMALY'
+            """,
+            (cluster_id, display_name, display_name, mapping_method, field_name, cluster_id),
+        )
+        return int(cur.rowcount or 0)
+
+
 def promote_anomaly_to_standard_cluster(
     conn,
     args: argparse.Namespace,
@@ -2138,7 +2445,7 @@ def promote_anomaly_to_standard_cluster(
         "name_resolution": name_resolution,
     }
 
-def create_or_update_anomaly_cluster(conn, args: argparse.Namespace, group: UnresolvedGroup, cluster_id: Optional[str] = None) -> tuple[str, str, dict[str, Any]]:
+def create_or_update_anomaly_cluster(conn, args: argparse.Namespace, group: UnresolvedGroup, cluster_id: Optional[str] = None, *, promote_if_threshold: bool = True) -> tuple[str, str, dict[str, Any]]:
     cluster_t = safe_pg_qualified_name(args.cluster_table)
     cluster_cols = get_columns(conn, args.cluster_table)
     field = group.field_name
@@ -2306,7 +2613,7 @@ def create_or_update_anomaly_cluster(conn, args: argparse.Namespace, group: Unre
                     "counters": counters,
                     "mapper_rows_updated": mapper_rows_updated,
                 }
-                if threshold_met:
+                if threshold_met and promote_if_threshold:
                     promotion_meta = promote_anomaly_to_standard_cluster(
                         conn,
                         args,
@@ -2353,7 +2660,7 @@ def create_or_update_anomaly_cluster(conn, args: argparse.Namespace, group: Unre
         "counters": counters,
         "mapper_rows_updated": mapper_rows_updated,
     }
-    if threshold_met:
+    if threshold_met and promote_if_threshold:
         promotion_meta = promote_anomaly_to_standard_cluster(
             conn,
             args,
@@ -2433,18 +2740,94 @@ def update_mapper_output_to_anomaly_cluster(
                 updated_at = NOW()
             WHERE field_name = %s
               AND normalized_label = %s
-              AND mapping_status IN ('TRUE_ANOMALY', 'NEW_CLUSTER_CANDIDATE')
+              AND mapping_status IN ('TRUE_ANOMALY', 'NEW_CLUSTER_CANDIDATE', 'KNOWN_TRUE_ANOMALY')
             """,
             (cluster_id, display_name, display_name, mapping_method, group.field_name, group.normalized_label),
         )
         return int(cur.rowcount or 0)
 
+
+def maybe_promote_known_anomaly_cluster(
+    conn,
+    args: argparse.Namespace,
+    evidence: KnownAnomalyEvidenceGroup,
+) -> dict[str, Any]:
+    """Refresh counters for an existing known anomaly cluster and promote it if thresholds are met."""
+    info = get_cluster_identity(conn, args, evidence.field_name, evidence.cluster_id)
+    if not info:
+        return {"promotion_status": "KNOWN_ANOMALY_CLUSTER_NOT_FOUND", "cluster_id": evidence.cluster_id}
+    if not bool(info.get("is_true_anomaly_cluster")):
+        return {"promotion_status": "ALREADY_STANDARD_CLUSTER", "cluster_id": evidence.cluster_id}
+
+    counters = compute_cluster_counters(conn, args, evidence.field_name, evidence.cluster_id)
+    threshold_met, threshold_reason = promotion_threshold_met(evidence.field_name, counters)
+    promotion_status = "STANDARD_CLUSTER_PROMOTION_CANDIDATE" if threshold_met else "ACTIVE_TRUE_ANOMALY"
+
+    cluster_t = safe_pg_qualified_name(args.cluster_table)
+    cluster_cols = get_columns(conn, args.cluster_table)
+    assignments = {
+        "promotion_status": promotion_status,
+        "weekly_first_seen": counters.get("first_seen") or evidence.group.first_seen,
+        "weekly_last_seen": counters.get("last_seen") or evidence.group.last_seen,
+        "weekly_occurrence_count": int(counters.get("row_count") or evidence.group.row_count),
+        "weekly_distinct_call_count": int(counters.get("distinct_call_count") or evidence.group.distinct_call_count),
+        "weekly_weeks_seen": int(counters.get("weeks_seen") or 1),
+        "promotion_candidate_reason": threshold_reason if threshold_met else None,
+        "updated_at": utcnow(),
+    }
+    set_parts = []
+    params: list[Any] = []
+    for col, value in assignments.items():
+        if col in cluster_cols:
+            set_parts.append(f"{safe_pg_identifier(col)} = %s")
+            params.append(value)
+    if set_parts:
+        params.extend([evidence.field_name, evidence.cluster_id])
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {cluster_t} SET {', '.join(set_parts)} WHERE field_name = %s AND cluster_id = %s",
+                params,
+            )
+
+    meta: dict[str, Any] = {
+        "promotion_status": promotion_status,
+        "promotion_reason": threshold_reason,
+        "counters": counters,
+    }
+    if threshold_met:
+        display_name = str(info.get("display_name") or evidence.display_name or evidence.cluster_id)
+        cluster_version = str(info.get("cluster_version") or evidence.cluster_version or args.weekly_cluster_version or "weekly")
+        promotion_meta = promote_anomaly_to_standard_cluster(
+            conn,
+            args,
+            evidence.group,
+            cluster_id=evidence.cluster_id,
+            cluster_version=cluster_version,
+            display_name=display_name,
+            threshold_reason=threshold_reason,
+        )
+        meta.update(promotion_meta)
+        if promotion_meta.get("promotion_status") == "PROMOTED_TO_STANDARD":
+            cluster_wide_rows = update_mapper_output_cluster_to_standard(
+                conn,
+                args,
+                field_name=evidence.field_name,
+                cluster_id=evidence.cluster_id,
+                display_name=str(promotion_meta.get("name_resolution", {}).get("display_name") or display_name),
+            )
+            meta["cluster_wide_mapper_rows_updated"] = cluster_wide_rows
+    return meta
+
+
 def weekly_unresolved_label_resolver(conn, args: argparse.Namespace, weekly_run_id: str, window_start: datetime, window_end: datetime) -> dict[str, Any]:
     groups = load_unresolved_groups(conn, args, window_start, window_end)
+    known_anomaly_groups = load_known_anomaly_evidence_groups(conn, args, window_start, window_end)
     summary = {
         "unresolved_groups": len(groups),
+        "known_anomaly_evidence_groups": len(known_anomaly_groups),
         "true_anomaly_groups": 0,
         "new_cluster_candidate_groups": 0,
+        "known_anomaly_clusters_refreshed": 0,
         "created_or_updated_anomaly_clusters": 0,
         "mapped_to_existing_clusters": 0,
         "attached_to_existing_anomaly_clusters": 0,
@@ -2461,11 +2844,14 @@ def weekly_unresolved_label_resolver(conn, args: argparse.Namespace, weekly_run_
             summary["promoted_to_standard_clusters"] += 1
         elif status == "STANDARD_CLUSTER_PROMOTION_BLOCKED_DUPLICATE_NAME":
             summary["promotion_blocked_duplicate_names"] += 1
-    if not groups:
-        print("Unresolved resolver: no TRUE_ANOMALY or NEW_CLUSTER_CANDIDATE groups found in window.")
+    if not groups and not known_anomaly_groups:
+        print("Weekly resolver: no TRUE_ANOMALY, NEW_CLUSTER_CANDIDATE, or KNOWN_TRUE_ANOMALY evidence groups found in window.")
         return summary
 
-    print(f"Unresolved resolver: processing {len(groups)} unresolved label groups.")
+    if groups:
+        print(f"Unresolved resolver: processing {len(groups)} unresolved label groups.")
+    else:
+        print("Unresolved resolver: no TRUE_ANOMALY or NEW_CLUSTER_CANDIDATE groups found in window.")
 
     for group in groups:
         status = group.primary_status
@@ -2610,6 +2996,59 @@ def weekly_unresolved_label_resolver(conn, args: argparse.Namespace, weekly_run_
                     "meta": meta,
                 },
             )
+
+
+    if known_anomaly_groups:
+        print(f"Known-anomaly resolver: processing {len(known_anomaly_groups)} known anomaly evidence groups.")
+
+    for evidence in known_anomaly_groups:
+        group = evidence.group
+        if args.apply:
+            cluster_id, display_name, meta = create_or_update_anomaly_cluster(
+                conn,
+                args,
+                group,
+                cluster_id=evidence.cluster_id,
+                promote_if_threshold=False,
+            )
+            promotion_meta = maybe_promote_known_anomaly_cluster(conn, args, evidence)
+            meta.update({f"known_anomaly_{k}": v for k, v in promotion_meta.items()})
+            summary["known_anomaly_clusters_refreshed"] += 1
+            count_promotion_result(promotion_meta)
+            resolution_status = "DONE"
+        else:
+            cluster_id = evidence.cluster_id
+            display_name = str(evidence.display_name or evidence.cluster_id)
+            meta = {
+                "dry_run": True,
+                "known_anomaly_cluster_id": evidence.cluster_id,
+                "note": "Would refresh known anomaly evidence, update anomaly counters, and promote if thresholds are met.",
+            }
+            resolution_status = "PLANNED"
+
+        log_action(
+            conn,
+            args,
+            weekly_run_id=weekly_run_id,
+            field_name=group.field_name,
+            normalized_label=group.normalized_label,
+            raw_label_examples=list(dict.fromkeys(group.raw_labels))[:10],
+            source_mapper_run_ids=group.mapper_run_ids,
+            source_record_ids=group.source_record_ids,
+            original_mapping_status="KNOWN_TRUE_ANOMALY",
+            recommended_action="REFRESH_KNOWN_ANOMALY_AND_PROMOTE_IF_RECURRING",
+            resolution_status=resolution_status,
+            target_cluster_id=cluster_id,
+            target_display_name=display_name,
+            similarity_score=group.avg_similarity,
+            evidence={
+                "row_count": group.row_count,
+                "distinct_call_count": group.distinct_call_count,
+                "avg_similarity": group.avg_similarity,
+                "max_similarity": group.max_similarity,
+                "meta": meta,
+            },
+        )
 
     if args.apply:
         conn.commit()
