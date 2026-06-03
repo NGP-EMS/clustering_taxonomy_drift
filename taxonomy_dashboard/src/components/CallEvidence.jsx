@@ -205,11 +205,6 @@ export default function CallEvidence({ fieldName, rawLabel }) {
           {data?.has_more && (
             <div style={{ fontSize: 8.5, color: '#64748b' }}>Showing latest 25 calls. More exist.</div>
           )}
-          {data?.date_filtered && (
-            <div style={{ fontSize: 8, color: '#475569', marginTop: 2 }}>
-              Searched most recent 30,000 calls. A GIN index is needed for full-history lookup.
-            </div>
-          )}
         </div>
       )}
     </div>

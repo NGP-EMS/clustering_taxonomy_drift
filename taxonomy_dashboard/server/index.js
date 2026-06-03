@@ -2659,15 +2659,14 @@ const TAXONOMY_FIELD_MAP = {
   outcome:              { type: 'scalar' }, // btree indexed
   outcome_base:         { type: 'scalar' }, // btree indexed
   main_reason:          { type: 'scalar' },
-  additional_tags:      { type: 'array',  indexed: true  }, // GIN indexed (sequence=1)
-  call_type_sub:        { type: 'array',  indexed: false }, // TODO: needs GIN index
-  outcome_sub:          { type: 'array',  indexed: false }, // TODO: needs GIN index
-  tags:                 { type: 'array',  indexed: false }, // TODO: needs GIN index
-  main_reason_sub:      { type: 'array',  indexed: false }, // TODO: needs GIN index
-  next_step:            { type: 'array',  indexed: false }, // TODO: needs GIN index
-  descriptive_keywords: { type: 'array',  indexed: false }, // TODO: needs GIN index
-  coaching_tags:        { type: 'array',  indexed: false }, // TODO: needs GIN index
-  rate_type:            { type: 'array',  indexed: false }, // TODO: needs GIN index
+  additional_tags:      { type: 'array' }, // GIN indexed (sequence=1)
+  call_type_sub:        { type: 'array' }, // GIN indexed (sequence=1)
+  outcome_sub:          { type: 'array' }, // GIN indexed (sequence=1)
+  tags:                 { type: 'array' }, // GIN indexed (sequence=1)
+  main_reason_sub:      { type: 'array' }, // GIN indexed (sequence=1)
+  next_step:            { type: 'array' }, // GIN indexed (sequence=1)
+  descriptive_keywords: { type: 'array' }, // GIN indexed (sequence=1)
+  coaching_tags:        { type: 'array' }, // GIN indexed (sequence=1)
 };
 
 
@@ -2722,24 +2721,23 @@ app.get('/api/calls/by-label', async (req, res) => {
 
   console.log(`[calls/by-label] field type=${colDef.type} — connecting to calls DB...`);
 
-  let arrayWhereExpr, scalarWhereExpr, queryValues;
+  let whereExpr, queryValues;
   if (isArrayField) {
     if (isMultiLabel) {
-      arrayWhereExpr = `nc."${fieldName}" @> $1::text[]`;
+      whereExpr   = `nc."${fieldName}" @> $1::text[]`;
       queryValues = [labelValues, limit];
     } else {
-      arrayWhereExpr = `nc."${fieldName}" @> ARRAY[$1::text]`;
+      whereExpr   = `nc."${fieldName}" @> ARRAY[$1::text]`;
       queryValues = [labelValues[0], limit];
     }
   } else {
-    scalarWhereExpr = `nc."${fieldName}" = $1`;
+    whereExpr   = `nc."${fieldName}" = $1`;
     queryValues = [labelValues[0], limit];
   }
 
   console.log(`[calls/by-label] WHERE ${isMultiLabel
     ? `"${fieldName}" @> [${labelValues.map(v => JSON.stringify(v)).join(',')}]`
     : `"${fieldName}" ${isArrayField ? '@>' : '='} ${JSON.stringify(queryValues[0])}`}`);
-
 
   let client;
   try {
@@ -2749,55 +2747,24 @@ app.get('/api/calls/by-label', async (req, res) => {
     await client.query('BEGIN');
     await client.query("SET LOCAL statement_timeout = '8000'");
 
-    let rows = [];
-
-    if (isArrayField) {
-     
-      const { rows: r } = await client.query(
-        `SELECT
-           nc.call_id,
-           nc.call_date_time,
-           nc.created_at,
-           nc.agent_name,
-           nc.call_summary,
-           SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
-           (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
-         FROM (
-           SELECT *
-           FROM ngp_call_classification
-           WHERE sequence = 1
-           ORDER BY call_date_time DESC
-           
-         ) nc
-         LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
-         WHERE ${arrayWhereExpr}
-         ORDER BY nc.call_date_time DESC
-         LIMIT $2`,
-        queryValues
-      );
-      rows = r;
-      console.log(`[calls/by-label] : ${rows.length} rows in ${Date.now() - t0}ms`);
-    } else {
-      // Scalar field with btree index — direct lookup, fast.
-      const { rows: r } = await client.query(
-        `SELECT
-           nc.call_id,
-           nc.call_date_time,
-           nc.created_at,
-           nc.agent_name,
-           nc.call_summary,
-           SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
-           (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
-         FROM ngp_call_classification nc
-         LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
-         WHERE ${scalarWhereExpr}
-           AND nc.sequence = 1
-         ORDER BY nc.call_date_time DESC
-         LIMIT $2`,
-        queryValues
-      );
-      rows = r;
-    }
+    const { rows } = await client.query(
+      `SELECT
+         nc.call_id,
+         nc.call_date_time,
+         nc.created_at,
+         nc.agent_name,
+         nc.call_summary,
+         SUBSTRING(nt.transcript, 1, 400) AS transcript_preview,
+         (nt.transcript IS NOT NULL AND LENGTH(nt.transcript) > 400) AS full_transcript_available
+       FROM ngp_call_classification nc
+       LEFT JOIN ngp_transcripts nt ON nc.call_id = nt.call_id
+       WHERE ${whereExpr}
+         AND nc.sequence = 1
+       ORDER BY nc.call_date_time DESC
+       LIMIT $2`,
+      queryValues
+    );
+    console.log(`[calls/by-label] : ${rows.length} rows in ${Date.now() - t0}ms`);
 
     await client.query('COMMIT');
 
@@ -2807,7 +2774,6 @@ app.get('/api/calls/by-label', async (req, res) => {
       searched_label: searchLabel,
       limit,
       field_indexed:  colDef.indexed !== false,
-      date_filtered:  isArrayField,
       calls: rows.map(r => ({
         call_id:                   r.call_id,
         call_date:                 r.call_date_time,
