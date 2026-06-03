@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, lazy, Suspense } from 'react'
+import { useEffect, useMemo, useRef, useState, lazy, Suspense } from 'react'
 import { RotateCcw, Map as MapIcon, Orbit, Search, SlidersHorizontal, Minus, Plus, Maximize2, Table2, Columns, LayoutDashboard, X } from 'lucide-react'
 import useStore from '../store/useStore.js'
 import RightInspector from '../components/layout/RightInspector.jsx'
@@ -203,7 +203,7 @@ function SceneLoader({ label = 'Initializing…' }) {
 }
 
 
-function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear, onRefreshIndex, semanticClusters = [] }) {
+function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onSearch, onClear, onRefreshIndex, semanticClusters = [], projectionStatus, onRegenerateProjection }) {
   const active = searchState?.active
   const loading = searchState?.loading
   const results = searchState?.results || []
@@ -255,6 +255,28 @@ function SemanticSearchPanel({ query, setQuery, searchState, selectedFields, onS
           <div className="text-[8px] leading-snug rounded px-2 py-1"
             style={{ color: '#10b981', background: 'rgba(16,185,129,0.07)', border: '1px solid rgba(16,185,129,0.18)' }}>
             ✓ Index rebuilt ({searchState.refreshDone.toLocaleString()} labels). Re-run your search.
+          </div>
+        )}
+
+        <button onClick={onRegenerateProjection} disabled={projectionStatus?.running}
+          title="Recompute UMAP/PCA 3D positions for all clusters. Runs automatically on server start. Re-run after a taxonomy update."
+          className="w-full flex items-center justify-center gap-1.5 rounded-lg py-1 text-[8.5px] font-medium transition-all duration-150 disabled:opacity-45 disabled:cursor-not-allowed"
+          style={{ background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.18)', color: projectionStatus?.running ? '#fbbf24' : '#475569' }}>
+          {projectionStatus?.running ? '⟳ Regenerating 3D positions…' : '↺ Regenerate 3D positions'}
+        </button>
+        {projectionStatus?.error && (
+          <div className="text-[8px] leading-snug rounded px-2 py-1"
+            style={{ color: '#fb7185', background: 'rgba(244,63,94,0.07)', border: '1px solid rgba(244,63,94,0.18)' }}>
+            3D regen failed: {projectionStatus.error}
+          </div>
+        )}
+        {projectionStatus?.done && !projectionStatus?.running && (
+          <div className="text-[8px] leading-snug rounded px-2 py-1 flex items-center justify-between gap-2"
+            style={{ color: '#fbbf24', background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.18)' }}>
+            <span>✓ 3D positions updated.</span>
+            <button onClick={() => window.location.reload()} className="underline underline-offset-2 hover:opacity-80">
+              Reload map
+            </button>
           </div>
         )}
 
@@ -337,6 +359,8 @@ export default function Observatory() {
   const [productionOverlay, setProductionOverlay] = useState({ available: false, rows: [], latest_run_id: null })
   const [semanticQuery, setSemanticQuery] = useState('')
   const [semanticSearch, setSemanticSearch] = useState({ active: false, query: '', results: [], loading: false, error: null, engine: null, refreshing: false, refreshError: null, refreshDone: null })
+  const [projection, setProjection] = useState({ running: false, lastRunAt: null, error: null, done: false })
+  const projPollRef = useRef(null)
 
   const sendSceneCommand = (action) => {
     window.dispatchEvent(new CustomEvent('semantic-scene-command', { detail: { action } }))
@@ -365,6 +389,35 @@ export default function Observatory() {
       setSemanticSearch(prev => ({ ...prev, refreshing: false, refreshError: err.message }))
     }
   }
+
+  const pollProjectionStatus = async () => {
+    try {
+      const d = await fetchJson('/api/projection/status', {}, 'Projection status')
+      setProjection(prev => ({ ...prev, running: d.running, lastRunAt: d.lastRunAt, error: d.error || null }))
+      if (d.running) {
+        projPollRef.current = setTimeout(pollProjectionStatus, 3000)
+      } else if (projPollRef.current) {
+        projPollRef.current = null
+        setProjection(prev => ({ ...prev, done: true }))
+      }
+    } catch (_) {}
+  }
+
+  const triggerProjectionRegenerate = async () => {
+    setProjection({ running: true, lastRunAt: null, error: null, done: false })
+    try {
+      await fetch('/api/projection/regenerate', { method: 'POST' })
+      projPollRef.current = setTimeout(pollProjectionStatus, 3000)
+    } catch (err) {
+      setProjection(prev => ({ ...prev, running: false, error: err.message }))
+    }
+  }
+
+  // Check projection status on mount — catches the server auto-run on startup
+  useEffect(() => {
+    pollProjectionStatus()
+    return () => { if (projPollRef.current) clearTimeout(projPollRef.current) }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const runSemanticSearch = async (overrideQuery) => {
     const q = String(overrideQuery ?? semanticQuery).trim()
@@ -669,6 +722,8 @@ export default function Observatory() {
             onClear={clearSemanticSearch}
             onRefreshIndex={refreshSemanticIndex}
             semanticClusters={semanticTopClusters}
+            projectionStatus={projection}
+            onRegenerateProjection={triggerProjectionRegenerate}
           />
 
           {/* Production overlay */}

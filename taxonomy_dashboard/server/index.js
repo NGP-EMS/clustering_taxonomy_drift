@@ -2633,6 +2633,69 @@ app.post('/api/semantic-index/refresh', async (req, res) => {
   }
 });
 
+// ── 3D Projection ──────────────────────────────────────────────────────────────
+const _proj = { running: false, lastRunAt: null, error: null, autoRun: false };
+
+function runProjectionScript() {
+  if (_proj.running) return;
+  _proj.running = true;
+  _proj.error   = null;
+
+  const pythonExec = process.env.SEMANTIC_SEARCH_PYTHON || process.env.PYTHON || 'python';
+  const scriptPath = path.resolve(__dirname, '../../generate_projection_coordinates.py');
+  const methods    = process.env.PROJECTION_METHODS || 'umap,pca';
+
+  console.log(`[projection] starting — methods=${methods}`);
+  const proc = spawn(pythonExec, [scriptPath, '--methods', methods], {
+    cwd: path.resolve(__dirname, '../..'),
+    env: process.env,
+  });
+
+  proc.stdout.on('data', d => process.stdout.write('[projection] ' + d));
+  proc.stderr.on('data', d => process.stderr.write('[projection] ' + d));
+
+  proc.on('close', code => {
+    _proj.running   = false;
+    _proj.lastRunAt = new Date().toISOString();
+    if (code === 0) {
+      _proj.error = null;
+      console.log('[projection] done ✓');
+    } else {
+      _proj.error = `Script exited with code ${code}`;
+      console.error(`[projection] ✗ ${_proj.error}`);
+    }
+  });
+
+  proc.on('error', err => {
+    _proj.running = false;
+    _proj.error   = err.message;
+    console.error('[projection] spawn error:', err.message);
+  });
+}
+
+// Auto-run once per server session (10 s delay so DB connections settle first)
+setTimeout(() => {
+  if (!_proj.autoRun) {
+    _proj.autoRun = true;
+    runProjectionScript();
+  }
+}, 10000);
+
+app.post('/api/projection/regenerate', (req, res) => {
+  if (_proj.running) return res.json({ running: true });
+  runProjectionScript();
+  res.json({ started: true });
+});
+
+app.get('/api/projection/status', (_req, res) => {
+  res.json({
+    running:   _proj.running,
+    lastRunAt: _proj.lastRunAt,
+    error:     _proj.error,
+    autoRun:   _proj.autoRun,
+  });
+});
+
 // ── Call Evidence ─────────────────────────────────────────────────────────────
 const callsPool = require('./callsDb');
 
