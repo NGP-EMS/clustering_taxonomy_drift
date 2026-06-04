@@ -19,12 +19,12 @@ from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 
 
-VALID_METHODS = {"umap", "tsne", "pca"}
+VALID_METHODS = {"umap", "umap_2d", "umap_3d", "tsne", "pca"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persist UMAP/t-SNE/PCA coordinates for semantic clusters.")
-    parser.add_argument("--methods", default="umap,pca", help="Comma-separated methods: umap,tsne,pca")
+    parser.add_argument("--methods", default="umap_2d,umap_3d,pca", help="Comma-separated methods: umap_2d,umap_3d,tsne,pca")
     parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL", ""), help="Embedding model label to persist.")
     parser.add_argument("--source-run-id", default="", help="Optional taxonomy_clusters.run_id filter.")
     parser.add_argument("--projection-run-id", default="", help="Projection run_id to persist. Defaults to each cluster run_id.")
@@ -66,7 +66,7 @@ def ensure_table(cur) -> None:
           id BIGSERIAL PRIMARY KEY,
           field_name TEXT NOT NULL,
           cluster_id TEXT NOT NULL,
-          projection_method TEXT NOT NULL CHECK (projection_method IN ('umap','tsne','pca')),
+          projection_method TEXT NOT NULL CHECK (projection_method IN ('umap','umap_2d','umap_3d','tsne','pca')),
           x DOUBLE PRECISION NOT NULL,
           y DOUBLE PRECISION NOT NULL,
           z DOUBLE PRECISION NOT NULL,
@@ -74,6 +74,20 @@ def ensure_table(cur) -> None:
           run_id TEXT NOT NULL DEFAULT '',
           created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         )
+        """
+    )
+    # Expand the CHECK constraint on existing tables so umap_2d / umap_3d are accepted.
+    cur.execute(
+        """
+        DO $$
+        BEGIN
+          ALTER TABLE semantic_projection_coordinates
+            DROP CONSTRAINT IF EXISTS semantic_projection_coordinates_projection_method_check;
+          ALTER TABLE semantic_projection_coordinates
+            ADD CONSTRAINT semantic_projection_coordinates_projection_method_check
+            CHECK (projection_method IN ('umap','umap_2d','umap_3d','tsne','pca'));
+        EXCEPTION WHEN others THEN NULL;
+        END $$
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_semantic_projection_field_name ON semantic_projection_coordinates(field_name)")
@@ -170,20 +184,22 @@ def compute_projection(method: str, vectors: np.ndarray, args: argparse.Namespac
 
         components = min(3, vectors.shape[0], vectors.shape[1])
         return pad_3d(PCA(n_components=components, random_state=args.random_state).fit_transform(vectors))
-    if method == "umap":
+    if method in ("umap", "umap_2d", "umap_3d"):
         try:
             import umap
         except ImportError as exc:
             raise RuntimeError("umap-learn is not installed. Run with --methods pca or install requirements.txt.") from exc
+        n_components = 2 if method == "umap_2d" else 3
         neighbors = min(max(2, args.umap_neighbors), max(2, n - 1))
         reducer = umap.UMAP(
-            n_components=3,
+            n_components=n_components,
             n_neighbors=neighbors,
             min_dist=args.umap_min_dist,
             metric="cosine",
             random_state=args.random_state,
         )
-        return reducer.fit_transform(vectors)
+        coords = reducer.fit_transform(vectors)
+        return pad_3d(coords)  # umap_2d gets z=0; umap_3d already has 3 cols
     if method == "tsne":
         from sklearn.manifold import TSNE
 
@@ -238,7 +254,7 @@ def parse_methods(value: str) -> list[str]:
     invalid = [m for m in methods if m not in VALID_METHODS]
     if invalid:
         raise ValueError(f"Invalid projection method(s): {', '.join(invalid)}")
-    return methods or ["umap", "pca"]
+    return methods or ["umap_2d", "umap_3d", "pca"]
 
 
 def main() -> None:

@@ -597,12 +597,12 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   // Observatory can request larger per-field samples. Keep a safety ceiling,
   // but do not silently force 8k requests back down to 5k.
   const requestedLimit = parseInt(filters.limit) || 50;
-  const maxClusterLimit = Math.max(parseInt(process.env.MAX_CLUSTER_API_LIMIT || '20000', 10) || 20000, 5000);
+  const maxClusterLimit = Math.max(parseInt(process.env.MAX_CLUSTER_API_LIMIT || '50000', 10) || 50000, 5000);
   const limit  = Math.min(Math.max(requestedLimit, 1), maxClusterLimit);
   const offset = Math.max(parseInt(filters.offset) || 0, 0);
-  const projectionMethod = ['umap', 'tsne', 'pca'].includes(String(filters.projection || '').toLowerCase())
+  const projectionMethod = ['umap', 'umap_2d', 'umap_3d', 'tsne', 'pca'].includes(String(filters.projection || '').toLowerCase())
     ? String(filters.projection).toLowerCase()
-    : 'umap';
+    : 'umap_2d';
   if (hasProjectionCoordinates) vals.push(projectionMethod);
   const projectionParam = hasProjectionCoordinates ? `$${vals.length}` : null;
   vals.push(limit);  const limitParam  = `$${vals.length}`;
@@ -2643,7 +2643,7 @@ function runProjectionScript() {
 
   const pythonExec = process.env.SEMANTIC_SEARCH_PYTHON || process.env.PYTHON || 'python';
   const scriptPath = path.resolve(__dirname, '../../generate_projection_coordinates.py');
-  const methods    = process.env.PROJECTION_METHODS || 'umap,pca';
+  const methods    = process.env.PROJECTION_METHODS || 'umap_2d,umap_3d,pca';
 
   console.log(`[projection] starting — methods=${methods}`);
   const proc = spawn(pythonExec, [scriptPath, '--methods', methods], {
@@ -2673,13 +2673,16 @@ function runProjectionScript() {
   });
 }
 
-// Auto-run once per server session (10 s delay so DB connections settle first)
-setTimeout(() => {
-  if (!_proj.autoRun) {
-    _proj.autoRun = true;
-    runProjectionScript();
-  }
-}, 10000);
+// Auto-run only when explicitly opted in via AUTO_GENERATE_PROJECTION=true.
+// Without this guard the server rewrites projection coordinates on every restart.
+if (process.env.AUTO_GENERATE_PROJECTION === 'true') {
+  setTimeout(() => {
+    if (!_proj.autoRun) {
+      _proj.autoRun = true;
+      runProjectionScript();
+    }
+  }, 10000);
+}
 
 app.post('/api/projection/regenerate', (req, res) => {
   if (_proj.running) return res.json({ running: true });

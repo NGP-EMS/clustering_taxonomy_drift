@@ -9,8 +9,8 @@ import { makeClusterKey } from '../utils/clusterKey.js'
 
 const SemanticScene = lazy(() => import('../components/scene/SemanticScene.jsx'))
 
-const OBSERVATORY_FIELD_LIMIT = 8000
-const OBSERVATORY_GLOBAL_LIMIT = 8000
+const OBSERVATORY_FIELD_LIMIT = 50000
+const OBSERVATORY_GLOBAL_LIMIT = 50000
 const SEMANTIC_MIN_SCORE = 0.10  // Voyage rerank-2.5-lite scores top out lower than cosine similarity
 
 function safeQueryStr(q) {
@@ -457,6 +457,9 @@ export default function Observatory() {
     return () => window.removeEventListener('semantic-search-select', onSelect)
   }, [setSelectedClusterId])
 
+  // umap_2d for flat map view, umap_3d for galaxy view — each is a distinct DB row
+  const projectionMethod = viewMode === '3d' ? 'umap_3d' : 'umap_2d'
+
   useEffect(() => {
     setLoading(true)
     Promise.allSettled([
@@ -477,14 +480,14 @@ export default function Observatory() {
         ? fieldsRes.value : []
 
       if (fieldList.length === 0) {
-        return fetch(`/api/clusters?limit=${OBSERVATORY_GLOBAL_LIMIT}&projection=umap`).then(r => r.json()).then(data => {
+        return fetch(`/api/clusters?limit=${OBSERVATORY_GLOBAL_LIMIT}&projection=${projectionMethod}`).then(r => r.json()).then(data => {
           if (Array.isArray(data)) setClusters(data.map(c => ({ ...c, _clusterKey: makeClusterKey(c) })))
         })
       }
 
       return Promise.allSettled(
         fieldList.map(f =>
-          fetch(`/api/clusters?field_name=${encodeURIComponent(f)}&limit=${OBSERVATORY_FIELD_LIMIT}&projection=umap`).then(r => r.json())
+          fetch(`/api/clusters?field_name=${encodeURIComponent(f)}&limit=${OBSERVATORY_FIELD_LIMIT}&projection=${projectionMethod}`).then(r => r.json())
         )
       ).then(results => {
         const seen = new Set(), merged = [], stats = {}
@@ -502,7 +505,7 @@ export default function Observatory() {
         setFieldStats(stats)
       })
     }).finally(() => setLoading(false))
-  }, [])
+  }, [projectionMethod]) // eslint-disable-line react-hooks/exhaustive-deps
 
 
   const productionOverlayMap = useMemo(() => {
