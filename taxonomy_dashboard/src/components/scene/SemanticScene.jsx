@@ -34,11 +34,13 @@ function shortLabel(value, max = 28) {
 
 function fitAll(cls, w, h) {
   if (!cls.length) return { tx: 0, ty: 0, sc: 5 }
-  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
-  for (const c of cls) {
-    x0 = Math.min(x0, c._pos[0]); x1 = Math.max(x1, c._pos[0])
-    y0 = Math.min(y0, c._pos[1]); y1 = Math.max(y1, c._pos[1])
-  }
+  // Use 2nd–98th percentile so a handful of outliers don't shrink the whole view
+  const xs = cls.map(c => c._pos[0]).sort((a, b) => a - b)
+  const ys = cls.map(c => c._pos[1]).sort((a, b) => a - b)
+  const n = cls.length
+  const clip = Math.max(0, Math.floor(n * 0.02))
+  const x0 = xs[clip], x1 = xs[Math.max(0, n - 1 - clip)]
+  const y0 = ys[clip], y1 = ys[Math.max(0, n - 1 - clip)]
   const sc = Math.min(w * 0.80 / ((x1 - x0) || 1), h * 0.80 / ((y1 - y0) || 1), 60)
   return { tx: -((x0 + x1) / 2) * sc, ty: ((y0 + y1) / 2) * sc, sc }
 }
@@ -203,13 +205,13 @@ function draw2D(ctx, cls, w, h, tx, ty, sc, selId, hovId, showL) {
     const isHov = hovId !== null && hovId === cKey
     if (isSel || isHov) { focusC = c; continue }
     const rawR = Math.max((c._size || 0.5) * sc, 0.75)
-    const r = Math.min(rawR, cls.length > 1200 ? 7.5 : 11)
+    const r = Math.min(rawR, cls.length > 20000 ? 2.2 : cls.length > 1200 ? 7.5 : 11)
     const [px, py] = w2c(c._pos[0], c._pos[1], w, h, tx, ty, sc)
     if (px + r < 0 || px - r > w || py + r < 0 || py - r > h) continue
     ctx.beginPath()
     ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.fillStyle = c._color || '#6366f1'
-    ctx.globalAlpha = cls.length > 2500 ? 0.58 : cls.length > 1200 ? 0.68 : 0.82
+    ctx.globalAlpha = cls.length > 20000 ? 0.22 : cls.length > 2500 ? 0.58 : cls.length > 1200 ? 0.68 : 0.82
     ctx.fill()
     if (c.production_hit_count) {
       ctx.globalAlpha = 0.9

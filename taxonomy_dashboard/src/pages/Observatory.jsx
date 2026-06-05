@@ -457,55 +457,49 @@ export default function Observatory() {
     return () => window.removeEventListener('semantic-search-select', onSelect)
   }, [setSelectedClusterId])
 
-  // umap_2d for flat map view, umap_3d for galaxy view — each is a distinct DB row
-  const projectionMethod = viewMode === '3d' ? 'umap_3d' : 'umap_2d'
+  const isAllFields = !activeFields?.length && !activeField
+  // All-fields: use 'tsne' (valid method, no rows in DB) → server JOIN returns null coords
+  // → sceneUtils falls back to projectedEmbeddingPosition → compact mixed layout
+  const projectionMethod = isAllFields ? 'tsne' : viewMode === '3d' ? 'umap_3d' : 'umap_2d'
 
+  // ── Metadata: load once on mount (no cluster data) ───────────────────────────
   useEffect(() => {
-    setLoading(true)
     Promise.allSettled([
-      fetch('/api/fields').then(r => r.json()),
       fetch('/api/anomaly-intelligence').then(r => r.json()),
       fetch('/api/semantic-compression').then(r => r.json()),
       fetch('/api/drift-summary').then(r => r.json()),
       fetch('/api/medoid-intelligence').then(r => r.json()),
       fetch('/api/production-mapper/semantic-overlay').then(r => r.json()),
-    ]).then(([fieldsRes, an, comp, dr, med, prod]) => {
+    ]).then(([an, comp, dr, med, prod]) => {
       if (an.status === 'fulfilled')   setAnomalySummary(an.value?.summary)
       if (comp.status === 'fulfilled') setCompression(comp.value)
       if (dr.status === 'fulfilled')   setDrift(dr.value)
       if (med.status === 'fulfilled')  setMedoid(med.value)
       if (prod.status === 'fulfilled') setProductionOverlay(prod.value)
+    })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-      const fieldList = (fieldsRes.status === 'fulfilled' && Array.isArray(fieldsRes.value))
-        ? fieldsRes.value : []
-
-      if (fieldList.length === 0) {
-        return fetch(`/api/clusters?limit=${OBSERVATORY_GLOBAL_LIMIT}&projection=${projectionMethod}`).then(r => r.json()).then(data => {
-          if (Array.isArray(data)) setClusters(data.map(c => ({ ...c, _clusterKey: makeClusterKey(c) })))
-        })
-      }
-
-      return Promise.allSettled(
-        fieldList.map(f =>
-          fetch(`/api/clusters?field_name=${encodeURIComponent(f)}&limit=${OBSERVATORY_FIELD_LIMIT}&projection=${projectionMethod}`).then(r => r.json())
-        )
-      ).then(results => {
-        const seen = new Set(), merged = [], stats = {}
-        results.forEach((r, idx) => {
-          if (r.status !== 'fulfilled' || !Array.isArray(r.value)) return
-          const field = fieldList[idx], data = r.value
-          stats[field] = { rendered: data.length, capped: data.length >= OBSERVATORY_FIELD_LIMIT }
-          data.forEach(c => {
-            // Use composite key (field::version::cluster_id) to avoid cross-field collisions
-            const key = makeClusterKey(c)
-            if (!seen.has(key)) { seen.add(key); merged.push({ ...c, _clusterKey: key }) }
-          })
-        })
-        setClusters(merged)
-        setFieldStats(stats)
+  // ── Clusters: single fetch, full state replacement on every field/projection change
+  useEffect(() => {
+    const currentFields = activeFields?.length ? activeFields : (activeField ? [activeField] : [])
+    const isSingleField = currentFields.length === 1
+    const url = isSingleField
+      ? `/api/clusters?field_name=${encodeURIComponent(currentFields[0])}&limit=${OBSERVATORY_FIELD_LIMIT}&projection=${projectionMethod}`
+      : `/api/clusters?limit=${OBSERVATORY_GLOBAL_LIMIT}&projection=${projectionMethod}`
+    console.log(`[Observatory] selectedField=${currentFields[0] || 'ALL'} url=${url}`)
+    setLoading(true)
+    setSelectedClusterId(null)
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        if (!Array.isArray(data)) return
+        const distinctFields = [...new Set(data.map(c => c.field_name))]
+        console.log(`[Observatory] response rows=${data.length} distinctFields=[${distinctFields.join(',')}]`)
+        setClusters(data.map(c => ({ ...c, _clusterKey: makeClusterKey(c) })))
       })
-    }).finally(() => setLoading(false))
-  }, [projectionMethod]) // eslint-disable-line react-hooks/exhaustive-deps
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [activeField, activeFields, viewMode]) // eslint-disable-line react-hooks/exhaustive-deps
 
 
   const productionOverlayMap = useMemo(() => {
@@ -585,6 +579,14 @@ export default function Observatory() {
     if (sizeFilter > 1 && (c.cluster_size || 0) < sizeFilter)      return false
     return true
   })
+
+  // Debug: fires when clusters or field selection changes
+  useEffect(() => {
+    const cFields = activeFields?.length ? activeFields : (activeField ? [activeField] : [])
+    const inDisplay = clusters.filter(c => !cFields.length || cFields.includes(c.field_name))
+    const distinct = [...new Set(inDisplay.map(c => c.field_name))]
+    console.log(`[Observatory] displayClusters≈${inDisplay.length} selectedFields=[${cFields.join(',')}] distinctInDisplay=[${distinct.join(',')}]`)
+  }, [clusters, activeField, activeFields]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const fieldGroups = clustersWithSemantic.reduce((acc, c) => {
     acc[c.field_name] = (acc[c.field_name] || 0) + 1; return acc

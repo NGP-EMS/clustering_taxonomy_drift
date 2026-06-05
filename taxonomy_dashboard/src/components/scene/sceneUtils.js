@@ -205,6 +205,9 @@ export function buildSpatialLayout(clusters, options = {}) {
     const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6)
     stats.projectionCenter = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2]
     stats.projectionScale = (options.projectionTargetSpan || (stats.map2d ? 150 : 145)) / span
+    console.log(`[sceneUtils] total=${clusters.length} withCoords=${projectedClusters.length} fallback=${clusters.length - projectedClusters.length} xRange=[${minX.toFixed(3)},${maxX.toFixed(3)}] yRange=[${minY.toFixed(3)},${maxY.toFixed(3)}] span=${span.toFixed(3)} scale=${stats.projectionScale.toFixed(3)}`)
+  } else {
+    console.log(`[sceneUtils] total=${clusters.length} withCoords=0 — ALL FALLBACK (no persisted projection)`)
   }
 
   return clusters.map(c => {

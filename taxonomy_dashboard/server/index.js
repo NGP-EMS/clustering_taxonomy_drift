@@ -12,6 +12,7 @@ const app  = express();
 
 app.use(cors());
 app.use(express.json());
+app.set('etag', false);
 
 // ── Schema cache ───────────────────────────────────────────────────────────────
 const _colCache = {};
@@ -600,11 +601,13 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   const maxClusterLimit = Math.max(parseInt(process.env.MAX_CLUSTER_API_LIMIT || '50000', 10) || 50000, 5000);
   const limit  = Math.min(Math.max(requestedLimit, 1), maxClusterLimit);
   const offset = Math.max(parseInt(filters.offset) || 0, 0);
-  const projectionMethod = ['umap', 'umap_2d', 'umap_3d', 'tsne', 'pca'].includes(String(filters.projection || '').toLowerCase())
-    ? String(filters.projection).toLowerCase()
-    : 'umap_2d';
-  if (hasProjectionCoordinates) vals.push(projectionMethod);
-  const projectionParam = hasProjectionCoordinates ? `$${vals.length}` : null;
+  const _requestedProj = String(filters.projection || '').toLowerCase();
+  const projectionMethod = ['umap_2d', 'umap_2d_cloud', 'umap_2d_legacy_cloud', 'umap_2d_compact_cloud', 'umap_3d', 'tsne', 'pca'].includes(_requestedProj)
+    ? _requestedProj
+    : null;
+  const useProjection = hasProjectionCoordinates && projectionMethod != null;
+  if (useProjection) vals.push(projectionMethod);
+  const projectionParam = useProjection ? `$${vals.length}` : null;
   vals.push(limit);  const limitParam  = `$${vals.length}`;
   vals.push(offset); const offsetParam = `$${vals.length}`;
 
@@ -634,16 +637,19 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
   const runIdExpr = tcCols.has('run_id') ? `COALESCE(tc.run_id, '')` : `''`;
   const clusterVersionExpr = tcCols.has('cluster_version') ? `COALESCE(tc.cluster_version,'v1')` : `'v1'`;
 
-  const projectionSelect = hasProjectionCoordinates
+  const projectionSelect = useProjection
     ? `spc.projection_method, spc.x AS projection_x, spc.y AS projection_y, spc.z AS projection_z`
     : `'fallback'::text AS projection_method, NULL::double precision AS projection_x, NULL::double precision AS projection_y, NULL::double precision AS projection_z`;
 
-  const projectionJoin = hasProjectionCoordinates
-    ? `LEFT JOIN semantic_projection_coordinates spc
-        ON spc.field_name = tc.field_name
-       AND spc.cluster_id = tc.cluster_id
-       AND spc.projection_method = ${projectionParam}
-       AND COALESCE(spc.run_id, '') = ${runIdExpr}`
+  const projectionJoin = useProjection
+    ? `LEFT JOIN (
+        SELECT DISTINCT ON (field_name, cluster_id, projection_method)
+          field_name, cluster_id, projection_method, x, y, z
+        FROM semantic_projection_coordinates
+        WHERE projection_method = ${projectionParam}
+        ORDER BY field_name, cluster_id, projection_method, created_at DESC
+      ) spc ON spc.field_name = tc.field_name
+           AND spc.cluster_id = tc.cluster_id`
     : '';
 
   const sql = `
@@ -711,8 +717,9 @@ app.get('/api/health', async (req, res) => {
              ${anomalyFrag}
       FROM taxonomy_clusters tc
       LEFT JOIN (
-        SELECT DISTINCT field_name, run_id, cluster_version, cluster_id
+        SELECT DISTINCT ON (field_name, cluster_id) field_name, run_id, cluster_version, cluster_id
         FROM taxonomy_cluster_names WHERE display_name IS NOT NULL
+        ORDER BY field_name, cluster_id
       ) n ON ${nJoin}
     `);
 
@@ -770,6 +777,26 @@ app.get('/api/health', async (req, res) => {
   } catch (err) { console.error('/api/health:', err.message); res.status(500).json({ error: err.message }); }
 });
 
+// ── GET /api/debug/projection-stats ───────────────────────────────────────────
+app.get('/api/debug/projection-stats', async (req, res) => {
+  try {
+    const exists = await tableExists('semantic_projection_coordinates');
+    if (!exists) return res.json({ error: 'table does not exist' });
+    const { rows } = await pool.query(`
+      SELECT projection_method,
+             COUNT(*) AS row_count,
+             COUNT(DISTINCT field_name || '::' || cluster_id) AS unique_clusters,
+             ROUND(MIN(x)::numeric, 4) AS x_min, ROUND(MAX(x)::numeric, 4) AS x_max,
+             ROUND(MIN(y)::numeric, 4) AS y_min, ROUND(MAX(y)::numeric, 4) AS y_max,
+             MAX(created_at) AS latest_run
+      FROM semantic_projection_coordinates
+      GROUP BY projection_method
+      ORDER BY projection_method
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── GET /api/fields ────────────────────────────────────────────────────────────
 app.get('/api/fields', async (req, res) => {
   try {
@@ -785,10 +812,22 @@ app.get('/api/clusters', async (req, res) => {
       field_name: req.query.field_name || '', search: req.query.search || '',
       anomaly: req.query.anomaly || '', named: req.query.named || '',
       min_size: req.query.min_size || '', limit: req.query.limit || 50, offset: req.query.offset || 0,
-      projection: req.query.projection || 'umap',
+      projection: req.query.projection || 'umap_2d',
     };
     const { sql, vals } = await buildClusterQuery({ filters });
     const { rows } = await pool.query(sql, vals);
+    const projMethod = filters.projection || 'umap_2d';
+    const nullProj = rows.filter(r => r.projection_x == null || r.projection_y == null).length;
+    const distinctFields = [...new Set(rows.map(r => r.field_name))];
+    const uniqueKeys = new Set(rows.map(r => `${r.field_name}::${r.cluster_id}`));
+    const dupCount = rows.length - uniqueKeys.size;
+    const withCoords = rows.filter(r => r.projection_x != null && r.projection_y != null);
+    const xVals = withCoords.map(r => Number(r.projection_x));
+    const yVals = withCoords.map(r => Number(r.projection_y));
+    const xRange = xVals.length ? `[${Math.min(...xVals).toFixed(3)}, ${Math.max(...xVals).toFixed(3)}]` : 'n/a';
+    const yRange = yVals.length ? `[${Math.min(...yVals).toFixed(3)}, ${Math.max(...yVals).toFixed(3)}]` : 'n/a';
+    console.log(`[/api/clusters] field=${filters.field_name || 'ALL'} proj=${projMethod} total=${rows.length} unique=${uniqueKeys.size} dups=${dupCount} nullProj=${nullProj} xRange=${xRange} yRange=${yRange} fields=[${distinctFields.join(',')}]`);
+    res.set('Cache-Control', 'no-store');
     res.json(rows);
   } catch (err) { console.error('/api/clusters:', err.message); res.status(500).json({ error: err.message }); }
 });
@@ -799,7 +838,7 @@ app.get('/api/anomalies', async (req, res) => {
     const filters = {
       field_name: req.query.field_name || '', search: req.query.search || '',
       limit: req.query.limit || 50, offset: req.query.offset || 0,
-      projection: req.query.projection || 'umap',
+      projection: req.query.projection || 'umap_2d',
     };
     const { sql, vals } = await buildClusterQuery({ filters, anomalyOnly: true });
     const { rows } = await pool.query(sql, vals);
@@ -2643,7 +2682,7 @@ function runProjectionScript() {
 
   const pythonExec = process.env.SEMANTIC_SEARCH_PYTHON || process.env.PYTHON || 'python';
   const scriptPath = path.resolve(__dirname, '../../generate_projection_coordinates.py');
-  const methods    = process.env.PROJECTION_METHODS || 'umap_2d,umap_3d,pca';
+  const methods    = process.env.PROJECTION_METHODS || 'umap_2d,umap_2d_cloud,umap_2d_legacy_cloud,umap_2d_compact_cloud,umap_3d,pca';
 
   console.log(`[projection] starting — methods=${methods}`);
   const proc = spawn(pythonExec, [scriptPath, '--methods', methods], {
