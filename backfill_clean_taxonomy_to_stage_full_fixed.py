@@ -108,12 +108,8 @@ MULTI_VALUE_FIELDS = {
 }
 
 
-COMPOSITE_ARRAY_FIELDS = {
-    "call_type_sub",
-    "outcome_sub",
-    "main_reason_sub",
-    "next_step",
-}
+
+COMPOSITE_ARRAY_FIELDS = set()
 
 
 DEFAULT_ACTIVE_RUN_IDS = {
@@ -635,6 +631,20 @@ def load_taxonomy_lookups(
                     clean_display_name,
                 ]
 
+                # If taxonomy stored a singleton array label like "{Try_Later}",
+                # also allow the inner item "Try_Later" to map item-by-item.
+                # This restores singleton mappings without collapsing multi-item arrays.
+                for candidate_source in [raw_label, normalized_label]:
+                    if candidate_source is None:
+                        continue
+
+                    candidate_text = str(candidate_source).strip()
+
+                    if candidate_text.startswith("{") and candidate_text.endswith("}"):
+                        singleton_items = parse_pg_array_literal(candidate_text)
+
+                        if len(singleton_items) == 1:
+                            candidates.append(singleton_items[0])
                 for candidate in candidates:
                     if candidate is None:
                         continue
