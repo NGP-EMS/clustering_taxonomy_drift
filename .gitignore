@@ -56,3 +56,4 @@ taxonomy_dashboard/.bge_cache/
 *.csv
 *.json
 *.xlsx
+archive_outputs/
