@@ -53,3 +53,6 @@ server/.bge_cache/
 scripts/.bge_cache/
 taxonomy_dashboard/.bge_cache/
 *.pkl
+*.csv
+*.json
+*.xlsx
