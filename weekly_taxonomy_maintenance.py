@@ -1989,13 +1989,36 @@ def sanitize_display_name_candidate(value: Any, *, max_words: int = DEFAULT_GPT_
     text = str(value or "").strip()
     if not text:
         return ""
+
     text = text.splitlines()[0]
+
+    # Remove common artifact wrappers before punctuation stripping.
+    text = text.replace("{", " ").replace("}", " ")
+    text = text.replace("[", " ").replace("]", " ")
+    text = text.replace("(", " ").replace(")", " ")
+
+    # Convert separators into spaces so "{Discovery,Admin Routing}" does not become "DiscoveryAdmin Routing".
+    text = re.sub(r"[_|,;:]+", " ", text)
+    text = text.replace("-", " ").replace("/", " ")
+
+    # Split camel case after wrapper/separator cleanup.
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+
+    # Remove trailing hash/id artifacts such as cc1904, 00456c, 4c0753.
+    text = re.sub(r"\b[0-9a-f]{5,}\b$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b[a-z]{1,8}[0-9a-f]{4,}\b$", "", text, flags=re.IGNORECASE)
+
+    # Do not keep artifact suffixes used only to avoid duplicate names.
+    text = re.sub(r"\banomaly\s+review\b", " ", text, flags=re.IGNORECASE)
+
     text = text.strip('"\'` .,:;|-_')
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^A-Za-z0-9 &/+-]", "", text).strip()
+    text = re.sub(r"[^A-Za-z0-9 &+]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
     words = [w for w in text.split() if w]
     if not words:
         return ""
+
     words = words[:max_words]
     out = []
     for word in words:
@@ -2008,6 +2031,7 @@ def sanitize_display_name_candidate(value: Any, *, max_words: int = DEFAULT_GPT_
             out.append(word)
         else:
             out.append(low.capitalize())
+
     return " ".join(out).strip()
 
 
