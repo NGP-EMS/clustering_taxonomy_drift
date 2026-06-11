@@ -2927,6 +2927,300 @@ app.get('/api/calls/by-label', async (req, res) => {
   }
 });
 
+// ── Backfill Monitor API ───────────────────────────────────────────────────────
+// All endpoints are safe-guarded: if the backfill tables do not exist yet
+// (migration not run) they return empty/null shapes rather than 500 errors.
+
+async function backfillTableExists(name) {
+  return tableExists(name);
+}
+
+// GET /api/backfill/summary
+// Latest run summary + resolver status counts from taxonomy_unresolved_label_queue.
+app.get('/api/backfill/summary', async (req, res) => {
+  try {
+    const [hasRuns, hasQueue] = await Promise.all([
+      backfillTableExists('taxonomy_backfill_runs'),
+      backfillTableExists('taxonomy_unresolved_label_queue'),
+    ]);
+
+    const latestRun = hasRuns
+      ? (await pool.query(`
+          SELECT backfill_run_id, mode, dry_run, source_schema, source_table,
+                 selected_fields, worker_count, batch_size, update_page_size,
+                 include_already_updated, started_at, finished_at, status,
+                 rows_scanned, rows_changed, rows_unchanged, rows_error,
+                 rows_pending_before, rows_pending_after, summary_json
+          FROM taxonomy_backfill_runs
+          ORDER BY started_at DESC NULLS LAST
+          LIMIT 1
+        `)).rows[0] || null
+      : null;
+
+    // A row is "materialized" when evidence_json contains {"materialized": true}.
+    // Materialized rows are excluded from active counts so the dashboard shows
+    // only labels that still need action.
+    const resolverCounts = hasQueue
+      ? (await pool.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE resolver_status IS NULL)::int AS pending,
+            COUNT(*) FILTER (WHERE resolver_status = 'MAP_TO_EXISTING'
+              AND NOT COALESCE((evidence_json->>'materialized')::boolean, false))::int AS map_to_existing,
+            COUNT(*) FILTER (WHERE resolver_status = 'ANOMALY'
+              AND NOT COALESCE((evidence_json->>'materialized')::boolean, false))::int AS anomaly,
+            COUNT(*) FILTER (WHERE resolver_status = 'PROMOTE'
+              AND NOT COALESCE((evidence_json->>'materialized')::boolean, false))::int AS promote,
+            COUNT(*) FILTER (WHERE
+              COALESCE((evidence_json->>'materialized')::boolean, false))::int AS materialized,
+            COUNT(*) FILTER (WHERE
+              resolver_status IS NULL
+              OR NOT COALESCE((evidence_json->>'materialized')::boolean, false)
+            )::int AS total_unresolved
+          FROM taxonomy_unresolved_label_queue
+        `)).rows[0]
+      : { pending: 0, map_to_existing: 0, anomaly: 0, promote: 0, materialized: 0, total_unresolved: 0 };
+
+    res.json({ latest_run: latestRun, resolver_counts: resolverCounts });
+  } catch (err) {
+    console.error('/api/backfill/summary:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/backfill/runs
+// Paginated run history.
+app.get('/api/backfill/runs', async (req, res) => {
+  try {
+    const exists = await backfillTableExists('taxonomy_backfill_runs');
+    if (!exists) return res.json({ rows: [], total: 0 });
+
+    const limit  = Math.min(Math.max(parseInt(req.query.limit)  || 20, 1), 200);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
+    const [{ rows }, { rows: [ct] }] = await Promise.all([
+      pool.query(
+        `SELECT backfill_run_id, status, dry_run, started_at, finished_at,
+                rows_scanned, rows_changed, rows_unchanged, rows_error,
+                rows_pending_before, rows_pending_after, selected_fields,
+                worker_count, batch_size, error_message
+         FROM taxonomy_backfill_runs
+         ORDER BY started_at DESC NULLS LAST
+         LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ),
+      pool.query('SELECT COUNT(*)::int AS total FROM taxonomy_backfill_runs'),
+    ]);
+
+    res.json({ rows, total: ct.total });
+  } catch (err) {
+    console.error('/api/backfill/runs:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/backfill/fields
+// Per-field aggregate for the latest run (or a specified backfill_run_id).
+app.get('/api/backfill/fields', async (req, res) => {
+  try {
+    const exists = await backfillTableExists('taxonomy_backfill_field_audit');
+    if (!exists) return res.json({ rows: [], run_id: null });
+
+    let runId = req.query.run_id || null;
+    if (!runId) {
+      const { rows: [latest] } = await pool.query(
+        `SELECT backfill_run_id FROM taxonomy_backfill_runs
+         ORDER BY started_at DESC NULLS LAST LIMIT 1`
+      );
+      runId = latest?.backfill_run_id || null;
+    }
+    if (!runId) return res.json({ rows: [], run_id: null });
+
+    const { rows } = await pool.query(
+      `SELECT
+         field_name,
+         COUNT(*)::int                                              AS scanned,
+         COUNT(*) FILTER (WHERE field_status = 'CHANGED')::int    AS changed,
+         COUNT(*) FILTER (WHERE field_status = 'UNCHANGED')::int  AS unchanged,
+         COUNT(*) FILTER (WHERE field_status = 'UNMAPPED')::int   AS unmapped,
+         COUNT(*) FILTER (WHERE field_status = 'AMBIGUOUS')::int  AS ambiguous,
+         COUNT(*) FILTER (WHERE field_status = 'ERROR')::int      AS errors,
+         COUNT(*) FILTER (WHERE field_status = 'EMPTY')::int      AS empty_count,
+         ROUND(
+           100.0 * COUNT(*) FILTER (WHERE field_status = 'CHANGED')
+                 / NULLIF(COUNT(*), 0), 2
+         )::double precision AS changed_pct
+       FROM taxonomy_backfill_field_audit
+       WHERE backfill_run_id = $1
+       GROUP BY field_name
+       ORDER BY changed DESC, field_name`,
+      [runId]
+    );
+
+    res.json({ rows, run_id: runId });
+  } catch (err) {
+    console.error('/api/backfill/fields:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/backfill/unresolved
+// Unresolved label queue with optional filtering.
+app.get('/api/backfill/unresolved', async (req, res) => {
+  try {
+    const exists = await backfillTableExists('taxonomy_unresolved_label_queue');
+    if (!exists) return res.json({ rows: [], total: 0 });
+
+    const limit        = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500);
+    const offset       = Math.max(parseInt(req.query.offset) || 0, 0);
+    const fieldName    = req.query.field_name      || null;
+    const statusFilter = req.query.resolver_status || null;
+
+    const vals = [];
+    const conds = [];
+    if (fieldName) { vals.push(fieldName); conds.push(`field_name = $${vals.length}`); }
+
+    if (statusFilter === 'null') {
+      // Truly unreviewed: no resolver recommendation yet
+      conds.push('resolver_status IS NULL');
+    } else if (statusFilter === 'MATERIALIZED') {
+      // Virtual status: rows that have been acted on by the autopilot
+      conds.push("COALESCE((evidence_json->>'materialized')::boolean, false) = true");
+    } else if (statusFilter) {
+      // A real resolver_status value — exclude already-materialized rows so the
+      // default view shows only labels still awaiting action.
+      vals.push(statusFilter);
+      conds.push(`resolver_status = $${vals.length}`);
+      conds.push("NOT COALESCE((evidence_json->>'materialized')::boolean, false)");
+    } else {
+      // No filter: exclude materialized by default so the default view is actionable.
+      // Frontend can pass resolver_status=MATERIALIZED to see completed rows.
+      conds.push("NOT COALESCE((evidence_json->>'materialized')::boolean, false)");
+    }
+
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+    const [{ rows }, { rows: [ct] }] = await Promise.all([
+      pool.query(
+        `SELECT id, field_name, raw_label, normalized_label,
+                occurrence_count, distinct_call_count,
+                resolver_status, target_cluster_id, target_display_name,
+                similarity_score, actor_guard_status, contradiction_guard_status,
+                first_seen_at, last_seen_at,
+                evidence_json
+         FROM taxonomy_unresolved_label_queue
+         ${where}
+         ORDER BY occurrence_count DESC, distinct_call_count DESC
+         LIMIT $${vals.length + 1} OFFSET $${vals.length + 2}`,
+        [...vals, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM taxonomy_unresolved_label_queue ${where}`,
+        vals
+      ),
+    ]);
+
+    res.json({ rows, total: ct.total });
+  } catch (err) {
+    console.error('/api/backfill/unresolved:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/backfill/row-audit
+// Row-level + field-level audit for a run.
+// ?run_id=...  &field_name=...  &row_status=...  &limit=  &offset=
+app.get('/api/backfill/row-audit', async (req, res) => {
+  try {
+    const [hasRow, hasField] = await Promise.all([
+      backfillTableExists('taxonomy_backfill_row_audit'),
+      backfillTableExists('taxonomy_backfill_field_audit'),
+    ]);
+    if (!hasRow) return res.json({ rows: [], total: 0 });
+
+    let runId = req.query.run_id || null;
+    if (!runId) {
+      const { rows: [latest] } = await pool.query(
+        `SELECT backfill_run_id FROM taxonomy_backfill_runs
+         ORDER BY started_at DESC NULLS LAST LIMIT 1`
+      );
+      runId = latest?.backfill_run_id || null;
+    }
+    if (!runId) return res.json({ rows: [], total: 0, run_id: null });
+
+    const limit      = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 500);
+    const offset     = Math.max(parseInt(req.query.offset) || 0, 0);
+    const rowStatus  = req.query.row_status  || null;
+    const fieldName  = req.query.field_name  || null;
+
+    const rowVals  = [runId];
+    const rowConds = ['ra.backfill_run_id = $1'];
+    if (rowStatus) { rowVals.push(rowStatus);  rowConds.push(`ra.row_status = $${rowVals.length}`); }
+
+    // If field_name filter is applied, narrow to rows that have at least one
+    // field_audit row for that field.
+    if (fieldName && hasField) {
+      rowVals.push(fieldName);
+      rowConds.push(
+        `EXISTS (
+           SELECT 1 FROM taxonomy_backfill_field_audit fa
+           WHERE fa.backfill_run_id = ra.backfill_run_id
+             AND fa.stage_row_id = ra.stage_row_id
+             AND fa.field_name = $${rowVals.length}
+         )`
+      );
+    }
+
+    const where = `WHERE ${rowConds.join(' AND ')}`;
+
+    const [{ rows: rowAudit }, { rows: [ct] }] = await Promise.all([
+      pool.query(
+        `SELECT ra.id, ra.stage_row_id, ra.call_id, ra.row_status,
+                ra.changed_fields, ra.unchanged_fields, ra.unmapped_fields,
+                ra.error_message, ra.old_row_hash, ra.new_row_hash, ra.created_at
+         FROM taxonomy_backfill_row_audit ra
+         ${where}
+         ORDER BY ra.id DESC
+         LIMIT $${rowVals.length + 1} OFFSET $${rowVals.length + 2}`,
+        [...rowVals, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM taxonomy_backfill_row_audit ra ${where}`,
+        rowVals
+      ),
+    ]);
+
+    // For each returned row, attach its field audit entries if the table exists
+    let fieldsByRow = {};
+    if (hasField && rowAudit.length) {
+      const stageRowIds = rowAudit.map(r => r.stage_row_id);
+      const { rows: fieldRows } = await pool.query(
+        `SELECT stage_row_id, field_name, old_value, new_value, changed,
+                field_status, mapping_method, mapped_display_names,
+                unmapped_labels, ambiguous_labels, notes
+         FROM taxonomy_backfill_field_audit
+         WHERE backfill_run_id = $1
+           AND stage_row_id = ANY($2)
+         ORDER BY stage_row_id, field_name`,
+        [runId, stageRowIds]
+      );
+      for (const fr of fieldRows) {
+        if (!fieldsByRow[fr.stage_row_id]) fieldsByRow[fr.stage_row_id] = [];
+        fieldsByRow[fr.stage_row_id].push(fr);
+      }
+    }
+
+    const enriched = rowAudit.map(r => ({
+      ...r,
+      field_audit: fieldsByRow[r.stage_row_id] || [],
+    }));
+
+    res.json({ rows: enriched, total: ct.total, run_id: runId });
+  } catch (err) {
+    console.error('/api/backfill/row-audit:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.SERVER_PORT || '5050', 10);
 app.listen(PORT, () => console.log(`Taxonomy API → http://localhost:${PORT}`));

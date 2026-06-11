@@ -6,8 +6,9 @@ import TopBar from './components/layout/TopBar.jsx'
 import RightInspector from './components/layout/RightInspector.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
 
-const Observatory  = lazy(() => import('./pages/Observatory.jsx'))
-const OverviewPage = lazy(() => import('./pages/OverviewPage.jsx'))
+const Observatory      = lazy(() => import('./pages/Observatory.jsx'))
+const OverviewPage     = lazy(() => import('./pages/OverviewPage.jsx'))
+const BackfillMonitor  = lazy(() => import('./pages/BackfillMonitor.jsx'))
 
 function PageSuspense({ children }) {
   return (
@@ -43,6 +44,7 @@ function AppShell() {
             <PageSuspense>
               {activePage === 'observatory' && <Observatory />}
               {activePage === 'overview' && <OverviewPage />}
+              {activePage === 'backfill' && <BackfillMonitor />}
             </PageSuspense>
           </main>
 

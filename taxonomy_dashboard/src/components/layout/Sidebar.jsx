@@ -1,10 +1,11 @@
 import { motion } from 'framer-motion'
-import { Orbit, LayoutDashboard, ChevronRight } from 'lucide-react'
+import { Orbit, LayoutDashboard, ChevronRight, ArrowDownToLine } from 'lucide-react'
 import useStore from '../../store/useStore.js'
 
 const NAV = [
   { id: 'observatory', label: 'Observatory',  sub: 'Explore clusters', Icon: Orbit,           color: '#00d4ff' },
-  { id: 'overview',    label: 'Analysis', sub: 'Insights', Icon: LayoutDashboard, color: '#a855f7' },
+  { id: 'overview',    label: 'Analysis',     sub: 'Insights',          Icon: LayoutDashboard, color: '#a855f7' },
+  { id: 'backfill',    label: 'Backfill',     sub: 'Monitor runs',      Icon: ArrowDownToLine, color: '#10b981' },
 ]
 
 function NavItem({ item, active, onClick }) {
