@@ -639,11 +639,17 @@ def write_recommendations(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_resolver(args) -> None:
+def run_resolver(args):
+    """
+    Returns (recommendations, labels) so the autopilot can use in-memory
+    proposals in dry-run Phase 3 without requiring a DB write.
+    """
     dsn = args.local_database_url
     if not dsn:
         raise RuntimeError("Missing local DB. Set LOCAL_DATABASE_URL or LOCAL_PG_* env vars.")
 
+    labels: List[Dict[str, Any]] = []
+    recommendations: List[Recommendation] = []
     conn = connect(dsn)
     conn.autocommit = False
 
@@ -658,72 +664,71 @@ def run_resolver(args) -> None:
 
         if not labels:
             logging.info("Nothing to resolve.")
-            return
+        else:
+            # Load active clusters (centroids + medoids + representative labels)
+            clusters_by_field = load_active_clusters(conn)
 
-        # Load active clusters (centroids + medoids + representative labels)
-        clusters_by_field = load_active_clusters(conn)
+            # Build contradiction maps per field
+            fields_seen = list({lbl["field_name"] for lbl in labels})
+            existing_maps: Dict[str, Dict[str, str]] = {}
+            for fn in fields_seen:
+                try:
+                    existing_maps[fn] = load_existing_map_labels(conn, "public", fn)
+                except Exception as exc:
+                    logging.warning("Could not load existing map for field %s: %s", fn, exc)
+                    existing_maps[fn] = {}
 
-        # Build contradiction maps per field
-        fields_seen = list({lbl["field_name"] for lbl in labels})
-        map_table_cols = set(get_table_columns(conn, "public", "taxonomy_label_cluster_map").keys())
-        existing_maps: Dict[str, Dict[str, str]] = {}
-        for fn in fields_seen:
-            try:
-                existing_maps[fn] = load_existing_map_labels(conn, "public", fn)
-            except Exception as exc:
-                logging.warning("Could not load existing map for field %s: %s", fn, exc)
-                existing_maps[fn] = {}
+            # Embed all labels in one batch
+            label_texts = [
+                lbl["normalized_label"] or lbl["raw_label"] or ""
+                for lbl in labels
+            ]
 
-        # Embed all labels in one batch
-        label_texts = [
-            lbl["normalized_label"] or lbl["raw_label"] or ""
-            for lbl in labels
-        ]
+            model = load_embedding_model(args.embedding_model, args.embedding_device)
+            logging.info("Embedding %d labels...", len(label_texts))
+            embeddings = embed_batch(model, label_texts)
+            del model  # release VRAM / memory
 
-        model = load_embedding_model(args.embedding_model, args.embedding_device)
-        logging.info("Embedding %d labels...", len(label_texts))
-        embeddings = embed_batch(model, label_texts)
-        del model  # release VRAM / memory
+            # Generate recommendations
+            for i, lbl in enumerate(labels):
+                fn = lbl["field_name"]
+                field_clusters = clusters_by_field.get(fn, [])
+                existing_map = existing_maps.get(fn, {})
+                emb = embeddings[i]
 
-        # Generate recommendations
-        recommendations: List[Recommendation] = []
-        for i, lbl in enumerate(labels):
-            fn = lbl["field_name"]
-            field_clusters = clusters_by_field.get(fn, [])
-            existing_map = existing_maps.get(fn, {})
-            emb = embeddings[i]
+                rec = recommend(
+                    label_row=lbl,
+                    label_embedding=emb,
+                    clusters=field_clusters,
+                    existing_map=existing_map,
+                    map_threshold=args.map_threshold,
+                    anomaly_threshold=args.anomaly_threshold,
+                    promote_min_occurrences=args.promote_min_occurrences,
+                    promote_min_calls=args.promote_min_calls,
+                )
+                recommendations.append(rec)
 
-            rec = recommend(
-                label_row=lbl,
-                label_embedding=emb,
-                clusters=field_clusters,
-                existing_map=existing_map,
-                map_threshold=args.map_threshold,
-                anomaly_threshold=args.anomaly_threshold,
-                promote_min_occurrences=args.promote_min_occurrences,
-                promote_min_calls=args.promote_min_calls,
-            )
-            recommendations.append(rec)
+            # Write (or dry-run) recommendations
+            counts = write_recommendations(conn, recommendations, dry_run=args.dry_run)
 
-        # Write (or dry-run) recommendations
-        counts = write_recommendations(conn, recommendations, dry_run=args.dry_run)
-
-        summary = {
-            "dry_run": args.dry_run,
-            "labels_processed": len(labels),
-            "MAP_TO_EXISTING": counts.get("MAP_TO_EXISTING", 0),
-            "ANOMALY": counts.get("ANOMALY", 0),
-            "PROMOTE": counts.get("PROMOTE", 0),
-            "skipped_null": counts.get("skipped_null", 0),
-            "map_threshold": args.map_threshold,
-            "anomaly_threshold": args.anomaly_threshold,
-            "promote_min_occurrences": args.promote_min_occurrences,
-            "promote_min_calls": args.promote_min_calls,
-        }
-        print(json.dumps(summary, indent=2))
+            summary = {
+                "dry_run": args.dry_run,
+                "labels_processed": len(labels),
+                "MAP_TO_EXISTING": counts.get("MAP_TO_EXISTING", 0),
+                "ANOMALY": counts.get("ANOMALY", 0),
+                "PROMOTE": counts.get("PROMOTE", 0),
+                "skipped_null": counts.get("skipped_null", 0),
+                "map_threshold": args.map_threshold,
+                "anomaly_threshold": args.anomaly_threshold,
+                "promote_min_occurrences": args.promote_min_occurrences,
+                "promote_min_calls": args.promote_min_calls,
+            }
+            print(json.dumps(summary, indent=2))
 
     finally:
         conn.close()
+
+    return recommendations, labels
 
 
 def parse_args(argv=None):

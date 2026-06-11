@@ -979,6 +979,37 @@ def phase1_backfill(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "reason": str(exc), "elapsed_sec": round(time.monotonic() - t0, 1)}
 
 
+# ── Phase 2 helpers ───────────────────────────────────────────────────────────
+
+def _recs_to_queue_rows(
+    recommendations: List[Any],
+    labels: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Convert Phase 2 Recommendation objects + parallel label dicts into the same
+    shape as rows returned by _load_queue_rows(), so Phase 3 can process them
+    in dry-run mode without requiring a DB write from Phase 2.
+    """
+    rows = []
+    for rec, lbl in zip(recommendations, labels):
+        if rec.resolver_status is None:
+            continue
+        rows.append({
+            "field_name":         rec.field_name,
+            "normalized_label":   rec.normalized_label,
+            "raw_label":          lbl.get("raw_label") or rec.normalized_label,
+            "resolver_status":    rec.resolver_status,
+            "target_cluster_id":  rec.target_cluster_id,
+            "target_display_name": rec.target_display_name,
+            "occurrence_count":   lbl.get("occurrence_count") or 1,
+            "distinct_call_count": lbl.get("distinct_call_count") or 0,
+            "source_examples":    lbl.get("source_examples") or [],
+            "evidence_json":      rec.evidence or {},
+            "similarity_score":   rec.similarity_score,
+        })
+    return rows
+
+
 # ── Phase 2 — Resolver ────────────────────────────────────────────────────────
 
 def phase2_resolve(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
@@ -1002,8 +1033,15 @@ def phase2_resolve(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         rargs = resolver.parse_args(argv)
-        resolver.run_resolver(rargs)
+        result = resolver.run_resolver(rargs)
         elapsed = time.monotonic() - t0
+        if isinstance(result, tuple) and len(result) == 2:
+            recs, lbls = result
+            phase_results["phase2_queue_rows"] = _recs_to_queue_rows(recs, lbls)
+            log.info(
+                "Phase 2 captured %d in-memory rows for dry-run Phase 3",
+                len(phase_results["phase2_queue_rows"]),
+            )
         return {"status": "ok", "elapsed_sec": round(elapsed, 1)}
     except SystemExit as exc:
         return {"status": "error", "reason": f"SystemExit({exc.code})", "elapsed_sec": round(time.monotonic() - t0, 1)}
@@ -1071,7 +1109,23 @@ def phase3_materialize(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
     conn = psycopg2.connect(local_dsn)
     conn.autocommit = False  # explicit transaction for entire phase
     try:
-        rows = _load_queue_rows(conn, list(args.fields))
+        if args.apply:
+            rows = _load_queue_rows(conn, list(args.fields))
+        else:
+            # Dry-run: Phase 2 didn't write to DB, so seed rows from its in-memory
+            # proposals first, then append any DB rows from prior apply runs.
+            p2_rows: List[Dict[str, Any]] = list(phase_results.get("phase2_queue_rows") or [])
+            db_rows = _load_queue_rows(conn, list(args.fields))
+            seen: Set[Tuple[str, str]] = {
+                (r.get("field_name", ""), r.get("normalized_label", ""))
+                for r in p2_rows
+            }
+            for r in db_rows:
+                key = (r.get("field_name", ""), r.get("normalized_label", ""))
+                if key not in seen:
+                    p2_rows.append(r)
+                    seen.add(key)
+            rows = p2_rows
         log.info("Phase 3: %d queue rows to materialize", len(rows))
 
         if not rows:
