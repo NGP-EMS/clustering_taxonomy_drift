@@ -668,7 +668,7 @@ async function buildClusterQuery({ filters = {}, anomalyOnly = false }) {
       ${sel.embedding},
       ${sel.anomaly},
       ${sel.centroid},
-      tcn.display_name,
+      COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name,
       tcn.naming_method,
       ${sel.reason},
       COALESCE(lm_sub.label_count, 0) AS label_count,
@@ -873,7 +873,7 @@ app.get('/api/cluster/:id', async (req, res) => {
         ${aCol ? `${aCol} AS is_true_anomaly_cluster` : 'NULL::boolean AS is_true_anomaly_cluster'},
         ${tcCols.has('centroid_embedding') ? 'CASE WHEN tc.centroid_embedding IS NOT NULL THEN true ELSE false END' : tcCols.has('centroid') ? 'CASE WHEN tc.centroid IS NOT NULL THEN true ELSE false END' : 'false'} AS has_centroid,
         tc.created_at,
-        tcn.display_name, tcn.naming_method,
+        COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name, tcn.naming_method,
         ${tcnCols.has('naming_reason') ? 'tcn.naming_reason' : 'NULL::text AS naming_reason'}
       FROM taxonomy_clusters tc
       LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
@@ -1109,7 +1109,7 @@ app.get('/api/anomaly-intelligence', async (req, res) => {
         ${tcCols.has('representative_labels') ? 'tc.representative_labels::text' : 'NULL::text AS representative_labels'},
         ${tcCols.has('cluster_source')    ? 'tc.cluster_source'    : 'NULL::text AS cluster_source'},
         ${aCol} AS is_true_anomaly_cluster,
-        tcn.display_name, tcn.naming_method,
+        COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name, tcn.naming_method,
         ${tcnCols.has('naming_reason') ? 'tcn.naming_reason' : 'NULL::text AS naming_reason'},
         COALESCE(lm_sub.label_count, 0) AS label_count,
         CASE
@@ -1174,7 +1174,7 @@ app.get('/api/drift-summary', async (req, res) => {
           ${tcCols.has('cluster_size')  ? 'tc.cluster_size'  : 'NULL::int AS cluster_size'},
           ${tcCols.has('medoid_label')  ? 'tc.medoid_label'  : 'NULL::text AS medoid_label'},
           ${anomalyColSql(tcCols) ? `${anomalyColSql(tcCols)} AS is_true_anomaly_cluster` : 'NULL::boolean AS is_true_anomaly_cluster'},
-          tcn.display_name
+          COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name
         FROM taxonomy_clusters tc
         LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
         ORDER BY tc.created_at DESC LIMIT 20
@@ -1217,7 +1217,7 @@ app.get('/api/semantic-graph', async (req, res) => {
       SELECT tc.id, tc.field_name, tc.cluster_id,
         ${tcCols.has('cluster_size') ? 'COALESCE(tc.cluster_size,1)' : '1'} AS cluster_size,
         ${aCol ? `${aCol}` : 'NULL::boolean'} AS is_anomaly,
-        tcn.display_name
+        COALESCE(tcn.display_name, ${tcCols.has('display_name') ? 'tc.display_name' : 'NULL::text'}) AS display_name
       FROM taxonomy_clusters tc
       LEFT JOIN taxonomy_cluster_names tcn ON ${nameJoinSql(tcCols, tcnCols)}
       ${cond.length ? `WHERE ${cond.join(' AND ')}` : ''}
