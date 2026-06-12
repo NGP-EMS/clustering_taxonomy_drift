@@ -3,7 +3,7 @@
 taxonomy_unresolved_label_resolver.py
 
 Reads taxonomy_unresolved_label_queue (where resolver_status IS NULL) and
-recommends one of: MAP_TO_EXISTING | ANOMALY | PROMOTE.
+recommends one of: MAP_TO_EXISTING | ANOMALY | PROMOTE | REVIEW_HISTORICAL.
 
 What this script does:
   - Loads active cluster centroids, medoids, and representative labels from
@@ -14,15 +14,20 @@ What this script does:
     contradiction guard before recommending MAP_TO_EXISTING.
   - For labels that match known true-anomaly clusters: recommends ANOMALY.
   - For labels with no strong cluster match: recommends PROMOTE if they appear
-    frequently enough, otherwise leaves resolver_status NULL.
+    frequently enough, blocks repeated historical unresolved labels as REVIEW_HISTORICAL,
+    otherwise creates/keeps a low-signal true anomaly candidate.
   - Writes recommendations into taxonomy_unresolved_label_queue.
     Does NOT write to STAGE. Does NOT create clusters. Does NOT rename clusters.
+  - Optional historical backlog CSV prevents repeated old unresolved labels from being
+    auto-created as anomalies without review.
 
 Thresholds (configurable via CLI):
   --map-threshold     Cosine similarity to recommend MAP_TO_EXISTING (default 0.82).
   --anomaly-threshold Cosine similarity to recommend ANOMALY (default 0.78).
   --promote-min-occurrences   Minimum occurrence_count to recommend PROMOTE (default 20).
   --promote-min-calls         Minimum distinct_call_count to recommend PROMOTE (default 10).
+  --historical-unresolved-csv CSV with old unresolved labels: field_name,label,count.
+  --min-historical-count      Historical count threshold for REVIEW_HISTORICAL (default 10).
 
 Embedding:
   Uses SentenceTransformers (same model as production mapper).
@@ -54,6 +59,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -155,6 +161,47 @@ def normalize_loose(value: Any) -> Optional[str]:
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text if text else None
+
+
+def load_historical_unresolved_counts(path: Optional[str]) -> Dict[Tuple[str, str], int]:
+    """
+    Loads a historical unresolved-label backlog CSV.
+
+    Supported columns:
+      - field_name,label,count
+      - field_name,raw_label,occurrence_count
+      - field_name,normalized_label,occurrence_count
+
+    Returns:
+      {(field_name, normalized_label): total_historical_count}
+    """
+    if not path:
+        return {}
+
+    counts: Dict[Tuple[str, str], int] = defaultdict(int)
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            field_name = (row.get("field_name") or "").strip()
+            label = (
+                row.get("label")
+                or row.get("raw_label")
+                or row.get("normalized_label")
+                or ""
+            )
+            normalized_label = normalize_loose(label)
+
+            try:
+                count = int(row.get("count") or row.get("occurrence_count") or 0)
+            except Exception:
+                count = 0
+
+            if field_name and normalized_label and count > 0:
+                counts[(field_name, normalized_label)] += count
+
+    return dict(counts)
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
@@ -411,7 +458,7 @@ class Recommendation:
     queue_id: int
     field_name: str
     normalized_label: str
-    resolver_status: Optional[str]       # MAP_TO_EXISTING | ANOMALY | PROMOTE | None
+    resolver_status: Optional[str]       # MAP_TO_EXISTING | ANOMALY | PROMOTE | REVIEW_HISTORICAL | None
     target_cluster_id: Optional[str]
     target_display_name: Optional[str]
     similarity_score: Optional[float]
@@ -429,6 +476,8 @@ def recommend(
     anomaly_threshold: float,
     promote_min_occurrences: int,
     promote_min_calls: int,
+    historical_unresolved_counts: Optional[Dict[Tuple[str, str], int]] = None,
+    min_historical_count: int = 10,
 ) -> Recommendation:
     queue_id = label_row["id"]
     field_name = label_row["field_name"]
@@ -436,6 +485,13 @@ def recommend(
     raw = label_row["raw_label"] or norm
     occurrences = label_row.get("occurrence_count", 0)
     distinct_calls = label_row.get("distinct_call_count", 0)
+
+    historical_unresolved_counts = historical_unresolved_counts or {}
+    normalized_key = normalize_loose(norm or raw) or ""
+    historical_count = int(
+        historical_unresolved_counts.get((field_name, normalized_key), 0)
+    )
+    total_unresolved_signal = int(occurrences or 0) + historical_count
 
     # Compute similarity to all clusters that have centroids
     scored: List[Tuple[float, ClusterRecord]] = []
@@ -462,9 +518,33 @@ def recommend(
         "top_candidates": top_candidates,
         "occurrences": occurrences,
         "distinct_calls": distinct_calls,
+        "historical_count": historical_count,
+        "total_unresolved_signal": total_unresolved_signal,
     }
 
     if not scored:
+        # No centroids available — cannot score. If this label already has
+        # repeated unresolved history, send it to review rather than promoting
+        # or leaving it unresolved automatically.
+        if historical_count >= min_historical_count:
+            return Recommendation(
+                queue_id=queue_id,
+                field_name=field_name,
+                normalized_label=norm,
+                resolver_status="REVIEW_HISTORICAL",
+                target_cluster_id=None,
+                target_display_name=None,
+                similarity_score=None,
+                actor_guard_status=None,
+                contradiction_guard_status=None,
+                evidence={
+                    **evidence,
+                    "min_historical_count": min_historical_count,
+                    "note": "historical_unresolved_backlog_blocks_auto_decision_no_centroids",
+                    "decision": "requires_review_for_map_promote_or_anomaly",
+                },
+            )
+
         # No centroids available — cannot score. Fall through to PROMOTE check.
         if occurrences >= promote_min_occurrences and distinct_calls >= promote_min_calls:
             return Recommendation(
@@ -536,6 +616,29 @@ def recommend(
             },
         )
 
+    # Historical backlog guard:
+    # If this label appeared repeatedly in older unresolved backfills, do not
+    # blindly create it as a true anomaly. Send it to review so it can be mapped,
+    # promoted, or intentionally kept as an anomaly.
+    if historical_count >= min_historical_count:
+        return Recommendation(
+            queue_id=queue_id,
+            field_name=field_name,
+            normalized_label=norm,
+            resolver_status="REVIEW_HISTORICAL",
+            target_cluster_id=None,
+            target_display_name=None,
+            similarity_score=round(best_sim, 4),
+            actor_guard_status=None,
+            contradiction_guard_status=None,
+            evidence={
+                **evidence,
+                "min_historical_count": min_historical_count,
+                "note": "historical_unresolved_backlog_blocks_auto_anomaly",
+                "decision": "requires_review_for_map_promote_or_anomaly",
+            },
+        )
+
     # No strong cluster match — check PROMOTE threshold
     if occurrences >= promote_min_occurrences and distinct_calls >= promote_min_calls:
         return Recommendation(
@@ -581,6 +684,7 @@ def write_recommendations(
         "MAP_TO_EXISTING": 0,
         "ANOMALY": 0,
         "PROMOTE": 0,
+        "REVIEW_HISTORICAL": 0,
         "skipped_null": 0,
         "total": len(recommendations),
     }
@@ -653,6 +757,19 @@ def run_resolver(args):
     conn = connect(dsn)
     conn.autocommit = False
 
+    historical_unresolved_counts = load_historical_unresolved_counts(
+        args.historical_unresolved_csv
+    )
+
+    if historical_unresolved_counts:
+        logging.info(
+            "Loaded historical unresolved backlog: %d field/label pairs from %s",
+            len(historical_unresolved_counts),
+            args.historical_unresolved_csv,
+        )
+    else:
+        logging.info("No historical unresolved backlog loaded")
+
     try:
         # Load unresolved labels
         labels = load_unresolved_labels(
@@ -705,6 +822,8 @@ def run_resolver(args):
                     anomaly_threshold=args.anomaly_threshold,
                     promote_min_occurrences=args.promote_min_occurrences,
                     promote_min_calls=args.promote_min_calls,
+                    historical_unresolved_counts=historical_unresolved_counts,
+                    min_historical_count=args.min_historical_count,
                 )
                 recommendations.append(rec)
 
@@ -717,7 +836,10 @@ def run_resolver(args):
                 "MAP_TO_EXISTING": counts.get("MAP_TO_EXISTING", 0),
                 "ANOMALY": counts.get("ANOMALY", 0),
                 "PROMOTE": counts.get("PROMOTE", 0),
+                "REVIEW_HISTORICAL": counts.get("REVIEW_HISTORICAL", 0),
                 "skipped_null": counts.get("skipped_null", 0),
+                "historical_unresolved_csv": args.historical_unresolved_csv,
+                "min_historical_count": args.min_historical_count,
                 "map_threshold": args.map_threshold,
                 "anomaly_threshold": args.anomaly_threshold,
                 "promote_min_occurrences": args.promote_min_occurrences,
@@ -771,6 +893,17 @@ def parse_args(argv=None):
     parser.add_argument("--anomaly-threshold", type=float, default=DEFAULT_ANOMALY_THRESHOLD)
     parser.add_argument("--promote-min-occurrences", type=int, default=DEFAULT_PROMOTE_MIN_OCCURRENCES)
     parser.add_argument("--promote-min-calls",        type=int, default=DEFAULT_PROMOTE_MIN_CALLS)
+    parser.add_argument(
+        "--historical-unresolved-csv",
+        default=None,
+        help="Optional CSV of historical unresolved labels from previous backfill runs.",
+    )
+    parser.add_argument(
+        "--min-historical-count",
+        type=int,
+        default=10,
+        help="Minimum historical unresolved count before blocking automatic anomaly creation.",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",

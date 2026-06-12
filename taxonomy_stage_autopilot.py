@@ -85,6 +85,13 @@ DEFAULT_FIELDS = [
 
 AUTOPILOT_CLUSTER_VERSION = f"autopilot_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
 
+REVIEW_ONLY_STATUSES = {
+    "REVIEW_HISTORICAL",
+    "REVIEW",
+    "MAP_REVIEW",
+    "PROMOTE_REVIEW",
+}
+
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -1030,19 +1037,41 @@ def phase2_resolve(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
         argv += ["--local-database-url", args.local_database_url]
     if args.embedding_device:
         argv += ["--embedding-device", args.embedding_device]
+    if getattr(args, "historical_unresolved_csv", None):
+        argv += ["--historical-unresolved-csv", args.historical_unresolved_csv]
+    if getattr(args, "min_historical_count", None) is not None:
+        argv += ["--min-historical-count", str(args.min_historical_count)]
 
     try:
         rargs = resolver.parse_args(argv)
         result = resolver.run_resolver(rargs)
         elapsed = time.monotonic() - t0
+        phase2_counts: Dict[str, int] = {}
+        rows_captured = 0
         if isinstance(result, tuple) and len(result) == 2:
             recs, lbls = result
             phase_results["phase2_queue_rows"] = _recs_to_queue_rows(recs, lbls)
+            rows_captured = len(phase_results["phase2_queue_rows"])
+
+            counts_tmp: Dict[str, int] = defaultdict(int)
+            for row in phase_results["phase2_queue_rows"]:
+                counts_tmp[str(row.get("resolver_status") or "NULL")] += 1
+            phase2_counts = dict(counts_tmp)
+
             log.info(
-                "Phase 2 captured %d in-memory rows for dry-run Phase 3",
-                len(phase_results["phase2_queue_rows"]),
+                "Phase 2 captured %d in-memory rows for dry-run Phase 3. Counts=%s",
+                rows_captured,
+                phase2_counts,
             )
-        return {"status": "ok", "elapsed_sec": round(elapsed, 1)}
+
+        return {
+            "status": "ok",
+            "elapsed_sec": round(elapsed, 1),
+            "rows_captured": rows_captured,
+            "resolver_counts": phase2_counts,
+            "historical_unresolved_csv": getattr(args, "historical_unresolved_csv", None),
+            "min_historical_count": getattr(args, "min_historical_count", None),
+        }
     except SystemExit as exc:
         return {"status": "error", "reason": f"SystemExit({exc.code})", "elapsed_sec": round(time.monotonic() - t0, 1)}
     except Exception as exc:
@@ -1156,6 +1185,25 @@ def phase3_materialize(args, phase_results: Dict[str, Any]) -> Dict[str, Any]:
 
             result: Dict[str, Any] = {}
 
+            if status in REVIEW_ONLY_STATUSES:
+                result = {
+                    "status": "review_skipped",
+                    "reason": "review-only resolver status; no materialization attempted",
+                    "resolver_status": status,
+                    "field_name": field,
+                    "normalized_label": norm,
+                    "run_id": run_id,
+                }
+                results_detail.append(result)
+                counts[f"{status}_review_skipped"] += 1
+                log.info(
+                    "Phase 3 review-only skip: field=%s norm=%r status=%s",
+                    field,
+                    norm,
+                    status,
+                )
+                continue
+
             if status == "MAP_TO_EXISTING":
                 result = materialize_map_to_existing(
                     conn, row,
@@ -1242,11 +1290,26 @@ def _fields_materialized_in_phase3(phase_results: Dict[str, Any]) -> List[str]:
     """Return the distinct fields that had successful materializations in Phase 3."""
     p3 = phase_results.get("phase3", {})
     detail = p3.get("detail") or []
+
+    success_values = {
+        "applied",
+        "dry_run",
+        "created",
+        "updated",
+    }
+
     fields = sorted({
         r.get("field_name", "")
         for r in detail
-        if r.get("status") in ("applied", "dry_run") and r.get("field_name")
+        if (
+            r.get("field_name")
+            and (
+                r.get("status") in success_values
+                or r.get("action") in success_values
+            )
+        )
     })
+
     return fields or []
 
 
@@ -1322,6 +1385,8 @@ def phase5_audit(args, phase_results: Dict[str, Any], total_elapsed: float) -> D
         "skipped_phases":   list(args.skip_phases),
         "total_elapsed_sec": round(total_elapsed, 1),
         "cluster_version":  AUTOPILOT_CLUSTER_VERSION,
+        "historical_unresolved_csv": getattr(args, "historical_unresolved_csv", None),
+        "min_historical_count": getattr(args, "min_historical_count", None),
         "phases":           {k: v for k, v in phase_results.items() if not k.startswith("phase3_affected")},
     }
 
@@ -1365,6 +1430,18 @@ def parse_args(argv=None):
         "--embedding-device",
         default=os.getenv("EMBEDDING_DEVICE", "cpu"),
         choices=["cpu", "cuda", "openvino"],
+    )
+    parser.add_argument(
+        "--historical-unresolved-csv",
+        default=None,
+        help="Optional CSV of historical unresolved labels from previous backfill runs. "
+             "Passed into Phase 2 resolver to block automatic anomaly creation for repeated old unresolved labels.",
+    )
+    parser.add_argument(
+        "--min-historical-count",
+        type=int,
+        default=10,
+        help="Minimum historical unresolved count before Phase 2 marks a label REVIEW_HISTORICAL instead of ANOMALY.",
     )
     parser.add_argument(
         "--log-level",
